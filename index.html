@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta
+      name="description"
+      content="Abyssal Weight — descend light, return burdened, and survive the climb."
+    />
+    <meta name="theme-color" content="#090d10" />
+    <title>Abyssal Weight</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23090d10'/%3E%3Cpath fill='%23e4a94d' d='M13 2h6v8h5l5 7-3 13H6L3 17l5-7h5z'/%3E%3Cpath fill='%23342519' d='M14 15h4v5h3v6H11v-6h3z'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="audio.js" defer></script>
+    <script src="game.js" defer></script>
+  </head>
+
+  <body>
+    <a class="skip-link" href="#gameCanvas">Skip to game</a>
+
+    <div class="page-shell">
+      <header class="game-header" aria-label="Abyssal Weight game header">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">
+            <span class="brand-chain"></span>
+            <span class="brand-weight"></span>
+          </span>
+          <span class="brand-copy">
+            <span class="game-title">ABYSSAL WEIGHT</span>
+            <span class="game-tagline">DESCEND · CLAIM · RETURN</span>
+          </span>
+        </div>
+
+        <div class="utility-controls" aria-label="Game settings">
+          <button
+            class="utility-button"
+            id="soundToggle"
+            type="button"
+            aria-label="Toggle sound"
+            aria-pressed="false"
+            title="Toggle sound"
+          >
+            <span class="utility-icon sound-icon" aria-hidden="true">♪</span>
+            <span class="utility-label">SOUND</span>
+          </button>
+          <button
+            class="utility-button"
+            id="fullscreenToggle"
+            type="button"
+            aria-label="Toggle fullscreen"
+            aria-pressed="false"
+            title="Toggle fullscreen"
+          >
+            <span class="utility-icon fullscreen-icon" aria-hidden="true">⛶</span>
+            <span class="utility-label">FULL</span>
+          </button>
+        </div>
+      </header>
+
+      <main class="game-main" aria-label="Abyssal Weight">
+        <section class="game-frame" aria-label="Game viewport">
+          <span class="frame-rivet rivet-top-left" aria-hidden="true"></span>
+          <span class="frame-rivet rivet-top-right" aria-hidden="true"></span>
+          <span class="frame-rivet rivet-bottom-left" aria-hidden="true"></span>
+          <span class="frame-rivet rivet-bottom-right" aria-hidden="true"></span>
+
+          <div class="canvas-stage">
+            <canvas
+              id="gameCanvas"
+              width="960"
+              height="540"
+              tabindex="0"
+              aria-label="Abyssal Weight game canvas"
+              aria-describedby="gameInstructions"
+            >
+              Your browser does not support the canvas element required to play Abyssal Weight.
+            </canvas>
+
+            <p id="gameInstructions" class="sr-only">
+              Use the arrow keys or WASD to move, attack with J, block with K, dodge with
+              Space, interact with E, pause with Escape, and choose Basin options with 1, 2,
+              or 3. On touch devices, rotate to landscape and use the on-screen controls.
+            </p>
+
+            <div id="loadingScreen" class="loading-screen" role="status" aria-live="polite">
+              <div class="loading-emblem" aria-hidden="true">
+                <span class="loading-chain"></span>
+                <span class="loading-burden"></span>
+              </div>
+              <p class="loading-title">LOWERING THE CAGE</p>
+              <p class="loading-copy">The abyss is waking…</p>
+              <span class="loading-meter" aria-hidden="true"><span></span></span>
+            </div>
+
+            <div id="touchControls" class="touch-controls" aria-label="Touch game controls">
+              <div class="touch-dpad" aria-label="Movement controls">
+                <button class="touch-button touch-up" type="button" data-action="up" aria-label="Move up">
+                  <span aria-hidden="true">▲</span>
+                </button>
+                <button class="touch-button touch-left" type="button" data-action="left" aria-label="Move left">
+                  <span aria-hidden="true">◀</span>
+                </button>
+                <button class="touch-button touch-down" type="button" data-action="down" aria-label="Move down">
+                  <span aria-hidden="true">▼</span>
+                </button>
+                <button class="touch-button touch-right" type="button" data-action="right" aria-label="Move right">
+                  <span aria-hidden="true">▶</span>
+                </button>
+              </div>
+
+              <div class="touch-actions" aria-label="Combat controls">
+                <button class="touch-button action-dodge" type="button" data-action="dodge" aria-label="Dodge">
+                  <span class="action-glyph" aria-hidden="true">↝</span>
+                  <span class="action-label">DODGE</span>
+                </button>
+                <button class="touch-button action-interact" type="button" data-action="interact" aria-label="Interact">
+                  <span class="action-glyph" aria-hidden="true">E</span>
+                  <span class="action-label">USE</span>
+                </button>
+                <button class="touch-button action-block" type="button" data-action="block" aria-label="Block">
+                  <span class="action-glyph" aria-hidden="true">◆</span>
+                  <span class="action-label">BLOCK</span>
+                </button>
+                <button class="touch-button action-attack" type="button" data-action="attack" aria-label="Attack">
+                  <span class="action-glyph" aria-hidden="true">†</span>
+                  <span class="action-label">ATTACK</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="orientation-hint" role="status">
+              <span class="orientation-glyph" aria-hidden="true">↻</span>
+              <strong>ROTATE FOR THE DESCENT</strong>
+              <span>Abyssal Weight is forged for landscape play.</span>
+            </div>
+          </div>
+        </section>
+
+        <div id="ariaLive" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+      </main>
+
+      <footer class="game-footer">
+        <span>THE DEEP KEEPS WHAT YOU CANNOT CARRY</span>
+        <span class="footer-credit">
+          Pixel environment art:
+          <a href="https://kenney.nl/assets/tiny-dungeon" target="_blank" rel="noopener noreferrer">
+            Tiny Dungeon by Kenney
+          </a>
+        </span>
+      </footer>
+    </div>
+  </body>
+</html>
