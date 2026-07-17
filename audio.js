@@ -10,26 +10,77 @@
     "victory",
   ]);
 
+  const BIOMES = new Set(["moss", "crystal", "foundry"]);
+
   const SFX_NAMES = new Set([
     "ui",
     "attack",
+    "melee",
+    "shoot",
+    "ricochet",
+    "reload",
+    "empty",
     "hit",
     "enemyHit",
     "coin",
     "dodge",
+    "dash",
     "block",
     "perfect",
     "parry",
+    "deflect",
     "stagger",
     "execute",
+    "explosion",
+    "enemyTell",
+    "hazard",
+    "weaponSwap",
     "hurt",
     "death",
     "step",
     "basin",
     "balloon",
+    "reward",
+    "roomClear",
     "extract",
     "bossRoar",
+    "bossPhase",
   ]);
+
+  // Dense combat can request the same cue many times in one simulation tick.
+  // These tiny voice limits preserve the attack rhythm without flattening the
+  // whole mix under a wall of overlapping transients.
+  const SFX_COOLDOWNS = Object.freeze({
+    ui: 0.025,
+    melee: 0.035,
+    attack: 0.035,
+    shoot: 0.026,
+    ricochet: 0.025,
+    reload: 0.08,
+    empty: 0.08,
+    hit: 0.035,
+    enemyHit: 0.025,
+    coin: 0.035,
+    dash: 0.08,
+    dodge: 0.08,
+    block: 0.055,
+    perfect: 0.08,
+    parry: 0.08,
+    deflect: 0.055,
+    stagger: 0.09,
+    execute: 0.15,
+    explosion: 0.075,
+    enemyTell: 0.06,
+    hazard: 0.09,
+    weaponSwap: 0.09,
+    hurt: 0.08,
+    death: 0.3,
+    step: 0.055,
+    reward: 0.14,
+    roomClear: 0.25,
+    bossRoar: 0.5,
+    bossPhase: 0.45,
+  });
 
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
   const finiteOr = (value, fallback) => {
@@ -53,6 +104,8 @@
       this.compressor = null;
 
       this.mode = AUDIO_MODES.has(options.mode) ? options.mode : "hub";
+      this.biome = BIOMES.has(options.biome) ? options.biome : "moss";
+      this.bossPhase = clamp(Math.round(finiteOr(options.bossPhase, 1)), 1, 3);
       this.combatIntensity = 0;
       this.muted = Boolean(options.muted);
       this.masterVolume = clamp(finiteOr(options.masterVolume, 0.42), 0, 1);
@@ -64,6 +117,7 @@
       this._destroyed = false;
       this._noiseBuffer = null;
       this._voices = new Set();
+      this._lastSfx = new Map();
       this._musicTimer = null;
       this._musicStep = 0;
       this._nextMusicTime = 0;
@@ -190,6 +244,62 @@
       return this.mode;
     }
 
+    setBiome(biome) {
+      if (!BIOMES.has(biome) || biome === this.biome) return this.biome;
+      this.biome = biome;
+      this._musicStep = 0;
+      if (this.ctx) this._nextMusicTime = this.ctx.currentTime + 0.045;
+      return this.biome;
+    }
+
+    setBossPhase(phase) {
+      const next = clamp(Math.round(finiteOr(phase, 1)), 1, 3);
+      if (next === this.bossPhase) return this.bossPhase;
+      this.bossPhase = next;
+      this._musicStep = 0;
+      if (this.ctx) this._nextMusicTime = this.ctx.currentTime + 0.035;
+      return this.bossPhase;
+    }
+
+    /**
+     * Compact state API for room transitions. Every key is optional:
+     * audio.setMusicState({ mode: "boss", biome: "crystal", intensity: .8, bossPhase: 2 })
+     */
+    setMusicState(state = {}) {
+      if (state.mode != null) this.setMode(state.mode);
+      if (state.biome != null) this.setBiome(state.biome);
+      if (state.intensity != null) this.setCombatIntensity(state.intensity);
+      if (state.bossPhase != null) this.setBossPhase(state.bossPhase);
+      return this.getState();
+    }
+
+    setVolumes(options = {}) {
+      if (options.master != null) this.masterVolume = clamp(finiteOr(options.master, this.masterVolume), 0, 1);
+      if (options.music != null) this.musicVolume = clamp(finiteOr(options.music, this.musicVolume), 0, 1);
+      if (options.sfx != null) this.sfxVolume = clamp(finiteOr(options.sfx, this.sfxVolume), 0, 1);
+      if (this.ctx) {
+        const now = this.ctx.currentTime;
+        this.musicGain.gain.setTargetAtTime(this._musicTarget(), now, 0.04);
+        this.sfxGain.gain.setTargetAtTime(this.sfxVolume, now, 0.04);
+        this._applyMasterVolume();
+      }
+      return this.getState();
+    }
+
+    getState() {
+      return {
+        unlocked: this._unlocked,
+        muted: this.muted,
+        mode: this.mode,
+        biome: this.biome,
+        intensity: this.combatIntensity,
+        bossPhase: this.bossPhase,
+        masterVolume: this.masterVolume,
+        musicVolume: this.musicVolume,
+        sfxVolume: this.sfxVolume,
+      };
+    }
+
     setCombatIntensity(value) {
       const numeric = Number(value);
       const next = Number.isFinite(numeric) ? clamp(numeric, 0, 1) : 0;
@@ -197,10 +307,23 @@
       this.combatIntensity = next;
       if (this.ctx && this.musicGain) {
         const now = this.ctx.currentTime;
-        const lift = 0.88 + this.combatIntensity * 0.18;
-        this.musicGain.gain.setTargetAtTime(this.musicVolume * lift, now, 0.15);
+        this.musicGain.gain.setTargetAtTime(this._musicTarget(), now, 0.15);
       }
       return this.combatIntensity;
+    }
+
+    _musicTarget() {
+      return this.musicVolume * (0.88 + this.combatIntensity * 0.18);
+    }
+
+    _duckMusic(amount = 0.36, duration = 0.16) {
+      if (!this.ctx || !this.musicGain) return;
+      const now = this.ctx.currentTime;
+      const gain = this.musicGain.gain;
+      const target = this._musicTarget();
+      gain.cancelScheduledValues(now);
+      gain.setTargetAtTime(target * clamp(1 - amount, 0.35, 1), now, 0.008);
+      gain.setTargetAtTime(target, now + Math.max(0.04, duration), 0.055);
     }
 
     _startMusicScheduler() {
@@ -241,21 +364,23 @@
     _musicTempo() {
       const base = {
         hub: 68,
-        descent: 88,
-        ascent: 108,
-        boss: 128,
+        descent: 100,
+        ascent: 118,
+        boss: 136,
         death: 54,
         victory: 96,
       }[this.mode];
       const intensityBoost = {
         hub: 3,
-        descent: 20,
-        ascent: 24,
-        boss: 18,
+        descent: 14,
+        ascent: 16,
+        boss: 12,
         death: 0,
         victory: 4,
       }[this.mode];
-      return base + intensityBoost * this.combatIntensity;
+      const biomePush = this.biome === "foundry" ? 4 : this.biome === "crystal" ? 2 : 0;
+      const phasePush = this.mode === "boss" ? (this.bossPhase - 1) * 4 : 0;
+      return base + biomePush + phasePush + intensityBoost * this.combatIntensity;
     }
 
     _composeMusicStep(step, time, duration) {
@@ -332,130 +457,190 @@
     }
 
     _musicDescent(step, time, d) {
-      const root = 38;
-      if (step % 2 === 0) {
-        const bassLine = [0, 0, 1, 3, 0, 5, 3, 1];
-        this._tone({
-          freq: midiToHz(root + bassLine[step / 2]),
-          time,
-          duration: d * 1.65,
-          type: "triangle",
-          volume: 0.061,
-          attack: 0.006,
-          release: d * 0.75,
-          filterFreq: 680,
-          bus: this.musicGain,
-          category: "music",
-        });
-      }
-      if (step % 4 === 0) this._kick(time, 0.052, "music");
-      if (step === 4 || step === 12) this._snare(time, 0.034, "music");
-
-      const melodySteps = [1, 3, 6, 9, 11, 14];
-      const melodyIndex = melodySteps.indexOf(step);
-      if (melodyIndex !== -1) {
-        const melody = [15, 13, 12, 17, 15, 13];
-        this._tone({
-          freq: midiToHz(root + melody[melodyIndex]),
-          time,
-          duration: d * 0.7,
-          type: "square",
-          volume: 0.027 + this.combatIntensity * 0.009,
-          release: d * 0.35,
-          filterFreq: 1750,
-          bus: this.musicGain,
-          category: "music",
-        });
-      }
-      if (this.combatIntensity > 0.35 && step % 2 === 1) {
-        this._hat(time, 0.012 + this.combatIntensity * 0.009, "music");
-      }
+      this._musicAction(step, time, d, "descent");
     }
 
     _musicAscent(step, time, d) {
-      const root = 37;
-      const bass = [0, 0, 3, 1, 0, 5, 6, 3];
-      if (step % 2 === 0) {
-        this._tone({
-          freq: midiToHz(root + bass[step / 2]),
-          time,
-          duration: d * 1.5,
-          type: "sawtooth",
-          volume: 0.044,
-          attack: 0.005,
-          release: d * 0.65,
-          filterFreq: 570 + this.combatIntensity * 350,
-          bus: this.musicGain,
-          category: "music",
-        });
-      }
-
-      if ([0, 3, 8, 11].includes(step)) this._kick(time, 0.061, "music");
-      if (step === 4 || step === 12) this._snare(time, 0.038, "music");
-      if (step % 2 === 1) this._hat(time, 0.014, "music");
-
-      const arp = [12, 15, 19, 20, 19, 15, 13, 10];
-      if (step % 2 === 0 || this.combatIntensity > 0.62) {
-        const i = this.combatIntensity > 0.62 ? step % 8 : (step / 2) % 8;
-        this._tone({
-          freq: midiToHz(root + arp[i]),
-          time,
-          duration: d * 0.62,
-          type: "square",
-          volume: 0.024 + this.combatIntensity * 0.008,
-          release: d * 0.28,
-          filterFreq: 1900,
-          bus: this.musicGain,
-          category: "music",
-        });
-      }
+      this._musicAction(step, time, d, "ascent");
     }
 
     _musicBoss(step, time, d) {
-      const root = 36;
-      const riff = [0, 0, 6, 5, 0, 8, 6, 3];
-      if (step % 2 === 0) {
-        const note = riff[step / 2];
-        this._tone({
-          freq: midiToHz(root + note),
-          time,
-          duration: d * 1.72,
-          type: "sawtooth",
-          volume: 0.056,
-          attack: 0.004,
-          release: d * 0.58,
-          filterFreq: 620 + this.combatIntensity * 450,
-          bus: this.musicGain,
-          category: "music",
-        });
-        this._tone({
-          freq: midiToHz(root + note + 12),
-          time,
-          duration: d * 0.7,
-          type: "square",
-          volume: 0.019,
-          release: d * 0.3,
-          filterFreq: 1300,
-          bus: this.musicGain,
-          category: "music",
-        });
-      }
-      if (step % 4 === 0 || (this.combatIntensity > 0.7 && step % 4 === 2)) {
-        this._kick(time, 0.073, "music");
-      }
-      if (step === 4 || step === 12) this._snare(time, 0.046, "music");
-      if (step % 2 === 1) this._hat(time, 0.018 + this.combatIntensity * 0.007, "music");
+      this._musicAction(step, time, d, "boss");
+    }
 
-      if (this.combatIntensity > 0.22) {
-        const highRiff = [12, 15, 18, 15, 20, 18, 15, 11];
+    /**
+     * The action score is assembled from independent layers. Intensity adds
+     * subdivisions and a lead instead of merely making the same loop louder;
+     * ascent adds pursuit syncopation, while boss phases alter the ostinato.
+     */
+    _musicAction(step, time, d, direction) {
+      const palette = {
+        moss: {
+          root: 38,
+          bass: [0, 0, 3, 5, 0, 7, 5, 3],
+          arp: [12, 15, 19, 22, 19, 15, 17, 14],
+          lead: [24, 22, 19, 17, 22, 24, 27, 22],
+          bassType: "triangle",
+          bassFilter: 720,
+        },
+        crystal: {
+          root: 41,
+          bass: [0, -2, 3, 1, 0, 5, 3, -2],
+          arp: [12, 19, 15, 22, 17, 24, 19, 15],
+          lead: [24, 27, 31, 29, 27, 22, 24, 19],
+          bassType: "triangle",
+          bassFilter: 920,
+        },
+        foundry: {
+          root: 34,
+          bass: [0, 0, 1, 6, 0, 8, 6, 1],
+          arp: [12, 13, 18, 13, 20, 18, 13, 11],
+          lead: [24, 25, 30, 29, 25, 32, 30, 25],
+          bassType: "sawtooth",
+          bassFilter: 590,
+        },
+      }[this.biome];
+
+      const isAscent = direction === "ascent";
+      const isBoss = direction === "boss";
+      const phaseEnergy = isBoss ? (this.bossPhase - 1) * 0.16 : 0;
+      const energy = clamp(
+        this.combatIntensity + (isAscent ? 0.14 : 0) + (isBoss ? 0.32 : 0) + phaseEnergy,
+        0,
+        1,
+      );
+      const bassIndex = step / 2;
+
+      // Foundation: each biome keeps a recognizable low-register identity.
+      if (step % 2 === 0) {
+        let note = palette.bass[bassIndex];
+        if (isBoss && this.bossPhase === 2 && step >= 8) note += 1;
+        if (isBoss && this.bossPhase === 3 && (step === 6 || step === 14)) note += 6;
         this._tone({
-          freq: midiToHz(root + highRiff[step % 8]),
+          freq: midiToHz(palette.root + note),
           time,
-          duration: d * 0.48,
-          type: "square",
-          volume: 0.019 + this.combatIntensity * 0.01,
-          release: d * 0.2,
-          filterFreq: 2200,
+          duration: d * (isBoss ? 1.76 : 1.52),
+          type: isAscent || isBoss ? "sawtooth" : palette.bassType,
+          volume: isBoss ? 0.059 : 0.049,
+          attack: 0.004,
+          release: d * 0.66,
+          filterFreq: palette.bassFilter + energy * 470,
+          bus: this.musicGain,
+          category: "music",
+        });
+      }
+
+      // Percussion communicates threat state before the player reads the HUD.
+      const kickSteps = isBoss
+        ? (energy > 0.78 ? [0, 2, 6, 8, 10, 14] : [0, 6, 8, 14])
+        : isAscent
+          ? [0, 3, 8, 11]
+          : [0, 8];
+      if (kickSteps.includes(step) || (energy > 0.84 && step === 12)) {
+        this._kick(time, (isBoss ? 0.074 : 0.058) + energy * 0.009, "music", 0, this.biome === "foundry" ? 82 : 96);
+      }
+      if (step === 4 || step === 12) {
+        this._snare(time, (isBoss ? 0.046 : 0.034) + energy * 0.007, "music");
+      }
+      if ((energy > 0.24 && step % 2 === 1) || (energy > 0.72 && step % 2 === 0)) {
+        this._hat(time, 0.009 + energy * 0.013, "music");
+      }
+
+      // Biome texture layer: organic drums, glass harmonics, or machinery.
+      if (this.biome === "moss") {
+        if ([3, 7, 11, 15].includes(step)) {
+          this._tone({
+            freq: (step === 7 || step === 15 ? 96 : 118) + energy * 18,
+            endFreq: 54,
+            time,
+            duration: d * 0.7,
+            type: "sine",
+            volume: 0.025 + energy * 0.01,
+            release: d * 0.55,
+            bus: this.musicGain,
+            category: "music",
+          });
+        }
+        if ((step === 2 || step === 10) && energy > 0.52) {
+          this._noise({
+            time,
+            duration: d * 0.6,
+            volume: 0.012,
+            filterType: "bandpass",
+            filterFreq: 780,
+            endFilterFreq: 1260,
+            q: 1.4,
+            bus: this.musicGain,
+            category: "music",
+          });
+        }
+      } else if (this.biome === "crystal") {
+        if (step % 2 === 0 || energy > 0.58) {
+          const arpIndex = energy > 0.58 ? step % 8 : bassIndex % 8;
+          this._tone({
+            freq: midiToHz(palette.root + palette.arp[arpIndex]),
+            time,
+            duration: d * 0.58,
+            type: step % 4 === 0 ? "sine" : "square",
+            volume: 0.019 + energy * 0.008,
+            release: d * 0.42,
+            filterFreq: 2900 + energy * 900,
+            bus: this.musicGain,
+            category: "music",
+          });
+        }
+        if ((step === 5 || step === 13) && energy > 0.3) {
+          [0, 7, 12].forEach((offset, index) => this._tone({
+            freq: midiToHz(palette.root + 24 + offset),
+            time: time + index * 0.012,
+            duration: d * 1.15,
+            type: "sine",
+            volume: 0.011,
+            attack: 0.003,
+            release: d * 0.9,
+            bus: this.musicGain,
+            category: "music",
+          }));
+        }
+      } else {
+        if ([2, 6, 10, 14].includes(step)) {
+          this._tone({
+            freq: (step % 8 === 2 ? 244 : 184),
+            endFreq: 92,
+            time,
+            duration: d * 0.38,
+            type: "square",
+            volume: 0.025 + energy * 0.009,
+            release: d * 0.26,
+            filterFreq: 1250,
+            bus: this.musicGain,
+            category: "music",
+          });
+          this._noise({
+            time,
+            duration: d * 0.25,
+            volume: 0.018,
+            filterType: "bandpass",
+            filterFreq: 1850,
+            q: 2.2,
+            bus: this.musicGain,
+            category: "music",
+          });
+        }
+      }
+
+      // Momentum lead; only enters once combat is underway, then doubles at
+      // maximum pressure or in the final boss phase.
+      if (energy > 0.46 && (step % 2 === 0 || energy > 0.8)) {
+        const leadIndex = energy > 0.8 ? step % 8 : bassIndex % 8;
+        this._tone({
+          freq: midiToHz(palette.root + palette.lead[leadIndex]),
+          time,
+          duration: d * (energy > 0.8 ? 0.4 : 0.62),
+          type: this.biome === "crystal" ? "sine" : "square",
+          volume: 0.014 + energy * 0.012,
+          release: d * 0.25,
+          filterFreq: this.biome === "foundry" ? 2050 : 2750,
           bus: this.musicGain,
           category: "music",
         });
@@ -548,11 +733,19 @@
       }
       if (this.ctx.state !== "running") return false;
 
-      const now = this.ctx.currentTime + 0.004;
+      const audibleNow = this.ctx.currentTime;
+      const cooldownKey = `${name}:${options.voice || "global"}`;
+      const cooldown = finiteOr(options.cooldown, SFX_COOLDOWNS[name] || 0);
+      const lastPlayed = this._lastSfx.get(cooldownKey) ?? -Infinity;
+      if (!options.force && audibleNow - lastPlayed < cooldown) return false;
+      this._lastSfx.set(cooldownKey, audibleNow);
+
+      const now = audibleNow + 0.004;
       const volume = clamp(finiteOr(options.volume, 1), 0, 2);
       const pitch = clamp(finiteOr(options.pitch, 1), 0.45, 2.2);
       const pan = clamp(finiteOr(options.pan, 0), -1, 1);
       const heavy = Boolean(options.heavy);
+      const variant = clamp(Math.round(finiteOr(options.variant, 0)), 0, 3);
       const tone = (config) => this._tone({
         bus: this.sfxGain,
         category: "sfx",
@@ -570,12 +763,36 @@
         case "ui":
           tone({ freq: 660 * pitch, time: now, duration: 0.045, type: "square", volume: 0.055 * volume, release: 0.025, filterFreq: 2400 });
           break;
-        case "attack": {
+        case "attack":
+        case "melee": {
           const length = heavy ? 0.21 : 0.125;
-          tone({ freq: (heavy ? 180 : 280) * pitch, endFreq: (heavy ? 52 : 92) * pitch, time: now, duration: length, type: "sawtooth", volume: (heavy ? 0.14 : 0.105) * volume, release: length * 0.72, filterFreq: heavy ? 900 : 1500 });
-          noise({ time: now, duration: length * 0.8, volume: 0.065 * volume, filterType: "bandpass", filterFreq: heavy ? 520 : 1050, endFilterFreq: 2400, q: 1.3 });
+          const color = 1 + variant * 0.075;
+          tone({ freq: (heavy ? 180 : 280) * pitch * color, endFreq: (heavy ? 52 : 92) * pitch, time: now, duration: length, type: "sawtooth", volume: (heavy ? 0.14 : 0.105) * volume, release: length * 0.72, filterFreq: heavy ? 900 : 1500 });
+          noise({ time: now, duration: length * 0.8, volume: 0.065 * volume, filterType: "bandpass", filterFreq: (heavy ? 520 : 1050) * color, endFilterFreq: 2400, q: 1.3 });
+          if (heavy) this._duckMusic(0.14, 0.08);
           break;
         }
+        case "shoot": {
+          const base = [620, 760, 490, 880][variant] * pitch;
+          tone({ freq: base, endFreq: base * (heavy ? 0.28 : 0.52), time: now, duration: heavy ? 0.13 : 0.072, type: variant === 2 ? "sawtooth" : "square", volume: (heavy ? 0.118 : 0.076) * volume, release: heavy ? 0.09 : 0.042, filterFreq: heavy ? 1900 : 3400 });
+          noise({ time: now, duration: heavy ? 0.08 : 0.038, volume: (heavy ? 0.08 : 0.052) * volume, filterType: "highpass", filterFreq: (heavy ? 1250 : 2600) * pitch });
+          if (heavy) this._kick(now, 0.07 * volume, "sfx", pan, 78 * pitch);
+          break;
+        }
+        case "ricochet":
+          tone({ freq: (1380 + variant * 185) * pitch, endFreq: (810 + variant * 90) * pitch, time: now, duration: 0.095, type: "square", volume: 0.057 * volume, release: 0.07, filterFreq: 4400 });
+          tone({ freq: (2080 + variant * 210) * pitch, time: now + 0.018, duration: 0.065, type: "sine", volume: 0.041 * volume, release: 0.05 });
+          break;
+        case "reload":
+          [0, 0.075, 0.17].forEach((offset, index) => {
+            const frequencies = heavy ? [230, 185, 420] : [420, 330, 720];
+            tone({ freq: frequencies[index] * pitch, endFreq: frequencies[index] * 0.78, time: now + offset, duration: index === 2 ? 0.075 : 0.045, type: index === 2 ? "triangle" : "square", volume: (index === 2 ? 0.062 : 0.047) * volume, release: index === 2 ? 0.05 : 0.025, filterFreq: 2400 });
+          });
+          break;
+        case "empty":
+          tone({ freq: 310 * pitch, endFreq: 205 * pitch, time: now, duration: 0.052, type: "square", volume: 0.052 * volume, release: 0.032, filterFreq: 1900 });
+          tone({ freq: 215 * pitch, time: now + 0.055, duration: 0.04, type: "triangle", volume: 0.034 * volume, release: 0.025 });
+          break;
         case "hit":
           this._kick(now, 0.16 * volume, "sfx", pan, 112 * pitch);
           noise({ time: now, duration: 0.09, volume: 0.095 * volume, filterType: "bandpass", filterFreq: 510 * pitch, q: 1.7 });
@@ -592,6 +809,10 @@
           noise({ time: now, duration: heavy ? 0.26 : 0.18, volume: (heavy ? 0.12 : 0.084) * volume, filterType: "bandpass", filterFreq: (heavy ? 260 : 620) * pitch, endFilterFreq: (heavy ? 900 : 2600) * pitch, q: 0.8 });
           tone({ freq: (heavy ? 82 : 145) * pitch, endFreq: (heavy ? 45 : 310) * pitch, time: now, duration: heavy ? 0.18 : 0.105, type: "triangle", volume: (heavy ? 0.072 : 0.038) * volume, release: heavy ? 0.14 : 0.07 });
           break;
+        case "dash":
+          noise({ time: now, duration: heavy ? 0.2 : 0.135, volume: (heavy ? 0.115 : 0.092) * volume, filterType: "bandpass", filterFreq: (heavy ? 310 : 780) * pitch, endFilterFreq: (heavy ? 1450 : 3900) * pitch, q: 0.7 });
+          tone({ freq: (heavy ? 105 : 210) * pitch, endFreq: (heavy ? 62 : 520) * pitch, time: now, duration: heavy ? 0.15 : 0.09, type: "sawtooth", volume: (heavy ? 0.068 : 0.044) * volume, release: heavy ? 0.11 : 0.06, filterFreq: 1800 });
+          break;
         case "block":
           this._metalChord(now, [218, 327, 463], 0.1, 0.052 * volume, pitch, pan);
           noise({ time: now, duration: 0.075, volume: 0.08 * volume, filterType: "highpass", filterFreq: 1700 * pitch });
@@ -604,6 +825,13 @@
           this._kick(now, 0.14 * volume, "sfx", pan, 130 * pitch);
           this._metalChord(now, [294, 466, 740, 1175], 0.15, 0.064 * volume, pitch, pan);
           noise({ time: now, duration: 0.07, volume: 0.105 * volume, filterType: "highpass", filterFreq: 2100 * pitch });
+          this._duckMusic(0.27, 0.12);
+          break;
+        case "deflect":
+          this._metalChord(now, [392, 622, 988, 1568], 0.13, 0.052 * volume, pitch, pan);
+          tone({ freq: 2350 * pitch, endFreq: 1480 * pitch, time: now + 0.025, duration: 0.12, type: "sine", volume: 0.058 * volume, release: 0.095 });
+          noise({ time: now, duration: 0.045, volume: 0.083 * volume, filterType: "highpass", filterFreq: 2700 * pitch });
+          this._duckMusic(0.2, 0.09);
           break;
         case "stagger":
           this._kick(now, 0.2 * volume, "sfx", pan, 92 * pitch);
@@ -613,10 +841,38 @@
           noise({ time: now, duration: 0.24, volume: 0.13 * volume, filterType: "bandpass", filterFreq: 2100 * pitch, endFilterFreq: 360 * pitch, q: 0.7 });
           tone({ freq: 390 * pitch, endFreq: 48 * pitch, time: now, duration: 0.29, type: "sawtooth", volume: 0.16 * volume, release: 0.2, filterFreq: 1200 });
           this._kick(now + 0.09, 0.23 * volume, "sfx", pan, 105 * pitch);
+          this._duckMusic(0.35, 0.18);
+          break;
+        case "explosion":
+          noise({ time: now, duration: heavy ? 0.48 : 0.3, volume: (heavy ? 0.17 : 0.135) * volume, attack: 0.002, release: heavy ? 0.42 : 0.25, filterType: "lowpass", filterFreq: (heavy ? 1250 : 1750) * pitch, endFilterFreq: 130 * pitch, q: 0.8, playbackRate: heavy ? 0.62 : 0.83 });
+          noise({ time: now, duration: heavy ? 0.19 : 0.12, volume: (heavy ? 0.1 : 0.075) * volume, filterType: "highpass", filterFreq: 2100 * pitch, endFilterFreq: 5800 * pitch });
+          this._kick(now, (heavy ? 0.245 : 0.19) * volume, "sfx", pan, (heavy ? 88 : 112) * pitch);
+          tone({ freq: (heavy ? 67 : 92) * pitch, endFreq: 31 * pitch, time: now, duration: heavy ? 0.42 : 0.27, type: "sine", volume: (heavy ? 0.18 : 0.12) * volume, release: heavy ? 0.36 : 0.22 });
+          this._duckMusic(heavy ? 0.48 : 0.34, heavy ? 0.3 : 0.2);
+          break;
+        case "enemyTell": {
+          const tellBase = [410, 515, 345, 625][variant] * pitch;
+          tone({ freq: tellBase, endFreq: tellBase * 1.72, time: now, duration: heavy ? 0.18 : 0.11, type: variant === 1 ? "sine" : "square", volume: (heavy ? 0.062 : 0.052) * volume, attack: 0.002, release: heavy ? 0.13 : 0.075, filterFreq: 3200 });
+          if (heavy) tone({ freq: tellBase * 0.5, time: now, duration: 0.16, type: "triangle", volume: 0.045 * volume, release: 0.12 });
+          break;
+        }
+        case "hazard":
+          if (heavy) {
+            tone({ freq: 86 * pitch, endFreq: 42 * pitch, time: now, duration: 0.32, type: "sawtooth", volume: 0.09 * volume, attack: 0.025, release: 0.22, filterFreq: 650 });
+            noise({ time: now, duration: 0.3, volume: 0.065 * volume, filterType: "lowpass", filterFreq: 840 * pitch, endFilterFreq: 190 * pitch, playbackRate: 0.65 });
+          } else {
+            noise({ time: now, duration: 0.22, volume: 0.058 * volume, filterType: "bandpass", filterFreq: (900 + variant * 410) * pitch, endFilterFreq: (2500 + variant * 330) * pitch, q: 1.2 });
+            tone({ freq: (220 + variant * 75) * pitch, endFreq: (410 + variant * 110) * pitch, time: now, duration: 0.15, type: "triangle", volume: 0.035 * volume, release: 0.1 });
+          }
+          break;
+        case "weaponSwap":
+          noise({ time: now, duration: 0.065, volume: 0.045 * volume, filterType: "bandpass", filterFreq: 1050 * pitch, endFilterFreq: 2350 * pitch, q: 1.5 });
+          tone({ freq: 360 * pitch, endFreq: 650 * pitch, time: now, duration: 0.08, type: "square", volume: 0.047 * volume, release: 0.05, filterFreq: 2900 });
           break;
         case "hurt":
           tone({ freq: 168 * pitch, endFreq: 59 * pitch, time: now, duration: 0.23, type: "sawtooth", volume: 0.125 * volume, release: 0.18, filterFreq: 830 });
           noise({ time: now, duration: 0.13, volume: 0.093 * volume, filterType: "bandpass", filterFreq: 390 * pitch, q: 0.9 });
+          this._duckMusic(0.24, 0.13);
           break;
         case "death":
           [0, 0.17, 0.35].forEach((offset, index) => {
@@ -640,6 +896,18 @@
             tone({ freq: frequency * pitch, time: now + index * 0.115, duration: 0.16, type: "square", volume: 0.045 * volume, release: 0.11, filterFreq: 2600 });
           });
           break;
+        case "reward":
+          [523, 659, 784, 1047].forEach((frequency, index) => {
+            tone({ freq: frequency * pitch, time: now + index * 0.055, duration: index === 3 ? 0.3 : 0.11, type: index === 3 ? "sine" : "square", volume: (index === 3 ? 0.072 : 0.052) * volume, attack: 0.003, release: index === 3 ? 0.24 : 0.075, filterFreq: 3800 });
+          });
+          noise({ time: now, duration: 0.22, volume: 0.028 * volume, filterType: "highpass", filterFreq: 3100, endFilterFreq: 6700 });
+          break;
+        case "roomClear":
+          [392, 523, 659].forEach((frequency, index) => {
+            tone({ freq: frequency * pitch, time: now + index * 0.085, duration: index === 2 ? 0.38 : 0.16, type: index === 2 ? "triangle" : "square", volume: (index === 2 ? 0.083 : 0.061) * volume, attack: 0.004, release: index === 2 ? 0.3 : 0.1, filterFreq: 3100 });
+          });
+          this._kick(now, 0.075 * volume, "sfx", pan, 102 * pitch);
+          break;
         case "extract":
           [294, 370, 440, 587, 740].forEach((frequency, index) => {
             tone({ freq: frequency * pitch, time: now + index * 0.105, duration: index === 4 ? 0.55 : 0.19, type: index === 4 ? "triangle" : "square", volume: (index === 4 ? 0.095 : 0.067) * volume, release: index === 4 ? 0.43 : 0.12, filterFreq: 2700 });
@@ -652,9 +920,29 @@
           [-11, 0, 9].forEach((detune, index) => {
             tone({ freq: (72 + index * 6) * pitch, endFreq: (39 + index * 3) * pitch, detune, time: now + index * 0.025, duration: 0.92, type: "sawtooth", volume: 0.075 * volume, attack: 0.08, release: 0.5, filterFreq: 620 });
           });
+          this._duckMusic(0.46, 0.5);
+          break;
+        case "bossPhase":
+          [110, 147, 196, 277, 392].forEach((frequency, index) => {
+            tone({ freq: frequency * pitch, endFreq: frequency * 1.08 * pitch, time: now + index * 0.055, duration: 0.2 + index * 0.04, type: index < 2 ? "sawtooth" : "square", volume: (0.065 + index * 0.006) * volume, attack: 0.006, release: 0.14 + index * 0.025, filterFreq: 1400 + index * 460 });
+          });
+          noise({ time: now + 0.12, duration: 0.48, volume: 0.1 * volume, filterType: "bandpass", filterFreq: 420 * pitch, endFilterFreq: 3200 * pitch, q: 0.75 });
+          this._kick(now + 0.31, 0.24 * volume, "sfx", pan, 118 * pitch);
+          this._duckMusic(0.55, 0.42);
           break;
       }
       return true;
+    }
+
+    play(name, options = {}) {
+      return this.sfx(name, options);
+    }
+
+    /** Map a horizontal world position to stereo without exposing Web Audio. */
+    playAt(name, x, center = 0, span = 320, options = {}) {
+      const safeSpan = Math.max(1, Math.abs(finiteOr(span, 320)));
+      const pan = clamp((finiteOr(x, center) - finiteOr(center, 0)) / (safeSpan * 0.5), -1, 1);
+      return this.sfx(name, { ...options, pan });
     }
 
     _metalChord(time, frequencies, duration, volume, pitch = 1, pan = 0) {
@@ -888,6 +1176,7 @@
       }
       this._stopVoices();
       this._voices.clear();
+      this._lastSfx.clear();
       this._noiseBuffer = null;
 
       const context = this.ctx;
@@ -904,6 +1193,7 @@
   }
 
   AudioEngine.MODES = Object.freeze(Array.from(AUDIO_MODES));
+  AudioEngine.BIOMES = Object.freeze(Array.from(BIOMES));
   AudioEngine.SFX = Object.freeze(Array.from(SFX_NAMES));
   scope.AudioEngine = AudioEngine;
 })(typeof window !== "undefined" ? window : globalThis);

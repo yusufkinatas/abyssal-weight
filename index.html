@@ -5,149 +5,218 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta
       name="description"
-      content="Abyssal Weight — descend light, return burdened, and survive the climb."
+      content="Abyssal Weight — an action extraction rogue-lite about descending light and fighting your burden back to the surface."
     />
-    <meta name="theme-color" content="#090d10" />
+    <meta name="theme-color" content="#05070a" />
     <title>Abyssal Weight</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23090d10'/%3E%3Cpath fill='%23e4a94d' d='M13 2h6v8h5l5 7-3 13H6L3 17l5-7h5z'/%3E%3Cpath fill='%23342519' d='M14 15h4v5h3v6H11v-6h3z'/%3E%3C/svg%3E" />
-    <link rel="stylesheet" href="styles.css" />
-    <script src="audio.js" defer></script>
-    <script src="game.js" defer></script>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2305070a'/%3E%3Cpath fill='%23f2b84b' d='M13 2h6v8h5l5 7-3 13H6L3 17l5-7h5z'/%3E%3Cpath fill='%23271b12' d='M14 15h4v5h3v6H11v-6h3z'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="styles.css?v=20260717-3" />
+    <script src="audio.js?v=20260717-3" defer></script>
+    <script type="module" src="game.js?v=20260717-3"></script>
   </head>
 
   <body>
-    <a class="skip-link" href="#gameCanvas">Skip to game</a>
+    <a class="skip-link" href="#gameCanvas">Skip to the game</a>
 
-    <div class="page-shell">
-      <header class="game-header" aria-label="Abyssal Weight game header">
-        <div class="brand-lockup">
-          <span class="brand-mark" aria-hidden="true">
-            <span class="brand-chain"></span>
-            <span class="brand-weight"></span>
-          </span>
-          <span class="brand-copy">
-            <span class="game-title">ABYSSAL WEIGHT</span>
-            <span class="game-tagline">DESCEND · CLAIM · RETURN</span>
-          </span>
+    <main id="gameStage" class="game-stage page-shell" aria-label="Abyssal Weight">
+      <canvas
+        id="gameCanvas"
+        width="960"
+        height="540"
+        tabindex="0"
+        aria-label="Abyssal Weight action game"
+        aria-describedby="gameInstructions"
+      >
+        Your browser does not support the canvas element required to play Abyssal Weight.
+      </canvas>
+
+      <p id="gameInstructions" class="sr-only">
+        Move with WASD or the arrow keys. Use the left mouse button or J for your primary
+        weapon, the right mouse button or K for your weapon Technique, Space to dodge,
+        Shift to deflect, R to reload, Q to swap weapons, and Escape to pause. Touch players can rotate to
+        landscape and use the on-screen movement and action controls.
+      </p>
+
+      <section id="hudLayer" class="hud-layer is-hidden" aria-label="Run status">
+        <div class="hud-top">
+          <section class="hud-card hud-vitals" aria-label="Health and stamina">
+            <div class="hud-section-heading">
+              <span class="hud-eyebrow">DELVER</span>
+              <span id="hudHealthText" class="hud-value">100 / 100</span>
+            </div>
+            <div class="meter meter-health" aria-hidden="true">
+              <span id="hudHealthFill" class="meter-fill"></span>
+            </div>
+            <div class="meter meter-stamina" aria-hidden="true">
+              <span id="hudStaminaFill" class="meter-fill"></span>
+            </div>
+          </section>
+
+          <section class="hud-card hud-run" aria-label="Current route">
+            <div class="hud-run-title">
+              <span id="hudDirection" class="direction-chip direction-descent">DESCENT</span>
+              <strong id="hudZone" class="hud-zone">MOSSY SHAFT</strong>
+              <span id="hudRoom" class="hud-room">ROOM 1 / 5</span>
+            </div>
+            <div id="hudRouteNodes" class="route-nodes" aria-label="Fifteen-room route progress">
+              <span class="route-node is-current"></span>
+              <span class="route-node"></span>
+              <span class="route-node"></span>
+              <span class="route-node"></span>
+              <span class="route-node is-gate"></span>
+              <span class="route-node"></span>
+              <span class="route-node"></span>
+              <span class="route-node"></span>
+              <span class="route-node"></span>
+              <span class="route-node is-gate"></span>
+              <span class="route-node"></span>
+              <span class="route-node"></span>
+              <span class="route-node"></span>
+              <span class="route-node"></span>
+              <span class="route-node is-gate"></span>
+            </div>
+          </section>
+
+          <section class="hud-card hud-burden" aria-label="Pressure, burden, and carried loot">
+            <div class="hud-section-heading">
+              <span class="hud-eyebrow">PRESSURE</span>
+              <span id="hudPressureLabel" class="hud-value">CALM</span>
+            </div>
+            <div class="meter meter-pressure" aria-hidden="true">
+              <span id="hudPressureFill" class="meter-fill"></span>
+            </div>
+            <div class="hud-section-heading burden-heading">
+              <span class="hud-eyebrow">BURDEN</span>
+              <span id="hudWeightText" class="hud-value">0% · LIGHT</span>
+            </div>
+            <div class="meter meter-weight" aria-hidden="true">
+              <span id="hudWeightFill" class="meter-fill"></span>
+              <i class="weight-mark weight-mark-light"></i>
+              <i class="weight-mark weight-mark-heavy"></i>
+            </div>
+            <div class="loot-readout"><span>CARRIED</span><strong id="hudLoot">0c</strong></div>
+          </section>
         </div>
 
-        <div class="utility-controls" aria-label="Game settings">
-          <button
-            class="utility-button"
-            id="soundToggle"
-            type="button"
-            aria-label="Toggle sound"
-            aria-pressed="false"
-            title="Toggle sound"
-          >
-            <span class="utility-icon sound-icon" aria-hidden="true">♪</span>
-            <span class="utility-label">SOUND</span>
-          </button>
-          <button
-            class="utility-button"
-            id="fullscreenToggle"
-            type="button"
-            aria-label="Toggle fullscreen"
-            aria-pressed="false"
-            title="Toggle fullscreen"
-          >
-            <span class="utility-icon fullscreen-icon" aria-hidden="true">⛶</span>
-            <span class="utility-label">FULL</span>
-          </button>
+        <div class="hud-bottom">
+          <section class="hud-card loadout-card" aria-label="Current weapon">
+            <div class="weapon-glyph" aria-hidden="true">◆</div>
+            <div class="weapon-copy">
+              <span class="hud-eyebrow">WEAPON</span>
+              <strong id="hudWeaponName">IRON REPEATER</strong>
+            </div>
+            <span id="hudWeaponAmmo" class="ammo-readout">∞</span>
+          </section>
+
+          <section id="hudBoons" class="boon-tray" aria-label="Run upgrades"></section>
         </div>
-      </header>
 
-      <main class="game-main" aria-label="Abyssal Weight">
-        <section class="game-frame" aria-label="Game viewport">
-          <span class="frame-rivet rivet-top-left" aria-hidden="true"></span>
-          <span class="frame-rivet rivet-top-right" aria-hidden="true"></span>
-          <span class="frame-rivet rivet-bottom-left" aria-hidden="true"></span>
-          <span class="frame-rivet rivet-bottom-right" aria-hidden="true"></span>
-
-          <div class="canvas-stage">
-            <canvas
-              id="gameCanvas"
-              width="960"
-              height="540"
-              tabindex="0"
-              aria-label="Abyssal Weight game canvas"
-              aria-describedby="gameInstructions"
-            >
-              Your browser does not support the canvas element required to play Abyssal Weight.
-            </canvas>
-
-            <p id="gameInstructions" class="sr-only">
-              Use the arrow keys or WASD to move, attack with J, block with K, dodge with
-              Space, interact with E, pause with Escape, and choose Basin options with 1, 2,
-              or 3. On touch devices, rotate to landscape and use the on-screen controls.
-            </p>
-
-            <div id="loadingScreen" class="loading-screen" role="status" aria-live="polite">
-              <div class="loading-emblem" aria-hidden="true">
-                <span class="loading-chain"></span>
-                <span class="loading-burden"></span>
-              </div>
-              <p class="loading-title">LOWERING THE CAGE</p>
-              <p class="loading-copy">The abyss is waking…</p>
-              <span class="loading-meter" aria-hidden="true"><span></span></span>
-            </div>
-
-            <div id="touchControls" class="touch-controls" aria-label="Touch game controls">
-              <div class="touch-dpad" aria-label="Movement controls">
-                <button class="touch-button touch-up" type="button" data-action="up" aria-label="Move up">
-                  <span aria-hidden="true">▲</span>
-                </button>
-                <button class="touch-button touch-left" type="button" data-action="left" aria-label="Move left">
-                  <span aria-hidden="true">◀</span>
-                </button>
-                <button class="touch-button touch-down" type="button" data-action="down" aria-label="Move down">
-                  <span aria-hidden="true">▼</span>
-                </button>
-                <button class="touch-button touch-right" type="button" data-action="right" aria-label="Move right">
-                  <span aria-hidden="true">▶</span>
-                </button>
-              </div>
-
-              <div class="touch-actions" aria-label="Combat controls">
-                <button class="touch-button action-dodge" type="button" data-action="dodge" aria-label="Dodge">
-                  <span class="action-glyph" aria-hidden="true">↝</span>
-                  <span class="action-label">DODGE</span>
-                </button>
-                <button class="touch-button action-interact" type="button" data-action="interact" aria-label="Interact">
-                  <span class="action-glyph" aria-hidden="true">E</span>
-                  <span class="action-label">USE</span>
-                </button>
-                <button class="touch-button action-block" type="button" data-action="block" aria-label="Block">
-                  <span class="action-glyph" aria-hidden="true">◆</span>
-                  <span class="action-label">BLOCK</span>
-                </button>
-                <button class="touch-button action-attack" type="button" data-action="attack" aria-label="Attack">
-                  <span class="action-glyph" aria-hidden="true">†</span>
-                  <span class="action-label">ATTACK</span>
-                </button>
-              </div>
-            </div>
-
-            <div class="orientation-hint" role="status">
-              <span class="orientation-glyph" aria-hidden="true">↻</span>
-              <strong>ROTATE FOR THE DESCENT</strong>
-              <span>Abyssal Weight is forged for landscape play.</span>
-            </div>
+        <section id="bossHud" class="boss-hud is-hidden" aria-label="Boss status">
+          <div class="boss-heading">
+            <strong id="bossName">THE ROOTBOUND</strong>
+            <span id="bossPhase">PHASE I</span>
+          </div>
+          <div class="boss-meter" aria-hidden="true">
+            <span id="bossHealthFill"></span>
           </div>
         </section>
+      </section>
 
-        <div id="ariaLive" class="sr-only" aria-live="polite" aria-atomic="true"></div>
-      </main>
+      <section id="screenLayer" class="screen-layer is-hidden" aria-live="polite">
+        <div id="screenPanel" class="screen-panel" tabindex="-1"></div>
+      </section>
 
-      <footer class="game-footer">
-        <span>THE DEEP KEEPS WHAT YOU CANNOT CARRY</span>
-        <span class="footer-credit">
-          Pixel environment art:
-          <a href="https://kenney.nl/assets/tiny-dungeon" target="_blank" rel="noopener noreferrer">
-            Tiny Dungeon by Kenney
-          </a>
-        </span>
-      </footer>
-    </div>
+      <div id="toastLayer" class="toast-layer" aria-live="polite" aria-atomic="true"></div>
+      <div id="roomBanner" class="room-banner is-hidden" role="status" aria-live="polite"></div>
+      <div id="damageVignette" class="damage-vignette" aria-hidden="true"></div>
+
+      <div id="loadingScreen" class="loading-screen" role="status" aria-live="polite">
+        <div class="loading-mark" aria-hidden="true">
+          <span class="loading-chain"></span>
+          <span class="loading-weight"></span>
+        </div>
+        <p class="loading-kicker">ABYSSAL WEIGHT</p>
+        <p class="loading-title">LOWERING THE CAGE</p>
+        <div class="loading-meter" aria-hidden="true"><span></span></div>
+        <p class="loading-copy">The deep is rearranging itself.</p>
+      </div>
+
+      <div id="touchControls" class="touch-controls" aria-label="Touch controls">
+        <div class="touch-dpad" aria-label="Movement controls">
+          <button class="touch-button touch-up" type="button" data-action="up" aria-label="Move up">▲</button>
+          <button class="touch-button touch-left" type="button" data-action="left" aria-label="Move left">◀</button>
+          <button class="touch-button touch-down" type="button" data-action="down" aria-label="Move down">▼</button>
+          <button class="touch-button touch-right" type="button" data-action="right" aria-label="Move right">▶</button>
+        </div>
+
+        <div class="touch-actions" aria-label="Combat controls">
+          <button class="touch-button action-swap" type="button" data-action="swap" aria-label="Swap weapon">
+            <span class="action-glyph" aria-hidden="true">⇄</span>
+            <span class="action-label">SWAP</span>
+          </button>
+          <button class="touch-button action-interact" type="button" data-action="interact" aria-label="Interact">
+            <span class="action-glyph" aria-hidden="true">E</span>
+            <span class="action-label">USE</span>
+          </button>
+          <button class="touch-button action-dodge" type="button" data-action="dodge" aria-label="Dodge">
+            <span class="action-glyph" aria-hidden="true">↝</span>
+            <span class="action-label">DODGE</span>
+          </button>
+          <button class="touch-button action-deflect" type="button" data-action="deflect" aria-label="Deflect">
+            <span class="action-glyph" aria-hidden="true">⌁</span>
+            <span class="action-label">PARRY</span>
+          </button>
+          <button class="touch-button action-secondary" type="button" data-action="secondary" aria-label="Use secondary weapon">
+            <span class="action-glyph" aria-hidden="true">◇</span>
+            <span class="action-label">ALT</span>
+          </button>
+          <button class="touch-button action-primary" type="button" data-action="primary" aria-label="Use primary weapon">
+            <span class="action-glyph" aria-hidden="true">✦</span>
+            <span class="action-label">FIRE</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="orientation-hint" role="status">
+        <span class="orientation-glyph" aria-hidden="true">↻</span>
+        <strong>ROTATE TO LANDSCAPE</strong>
+        <span>The abyss needs room to fight back.</span>
+      </div>
+
+      <nav class="stage-utilities" aria-label="Game settings">
+        <button
+          class="utility-button"
+          id="soundToggle"
+          type="button"
+          aria-label="Toggle sound"
+          aria-pressed="false"
+          title="Toggle sound"
+        >
+          <span class="utility-icon" aria-hidden="true">♪</span>
+          <span class="utility-label">SOUND</span>
+        </button>
+        <button
+          class="utility-button"
+          id="fullscreenToggle"
+          type="button"
+          aria-label="Toggle fullscreen"
+          aria-pressed="false"
+          title="Toggle fullscreen"
+        >
+          <span class="utility-icon" aria-hidden="true">⛶</span>
+          <span class="utility-label">FULL</span>
+        </button>
+      </nav>
+
+      <aside class="credit-corner">
+        <span>ART</span>
+        <a href="https://kenney.nl/assets/tiny-dungeon" target="_blank" rel="noopener noreferrer">KENNEY PACKS · CC0</a>
+      </aside>
+
+      <div id="ariaLive" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+    </main>
   </body>
 </html>

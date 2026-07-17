@@ -22,22 +22,23 @@ Then open [http://localhost:8000](http://localhost:8000) in your browser. Keep t
 | --- | --- |
 | Move | `WASD` or arrow keys |
 | Aim | Mouse |
-| Attack / parry on a weapon clash | Left mouse button or `J` |
-| Block / perfect block at impact | Right mouse button or `K` |
-| Dodge | `Space` or `Shift` |
-| Interact | `E` |
-| Basin choices | `1` balloon, `2` descend, `3` shoulder burden |
-| Surface upgrades / route | `1`–`4` purchase, `R` change unlocked route |
+| Primary attack | Left mouse button or `J` |
+| Weapon Technique | Right mouse button or `K` |
+| Dodge / shoulder dash | `Space` |
+| Deflect bullets and melee | `Shift` |
+| Reload firearm | `R` |
+| Swap unlocked weapon | `Q` |
+| Operate room mechanism | `E` or `Enter` |
 | Pause | `Esc` |
 | Mute / unmute | `M` |
 
 ## The great cycle
 
-Descend through the chasm while light and agile, fighting enemies and kicking treasure into each floor's basin. At a basin, choose whether to continue deeper or shoulder everything collected so far. Once burdened, climb back through altered floors and unavoidable Tax Collectors. Only loot carried all the way to the Surface is fully extracted.
+Descend through 15 authored combat rooms across the Mosswound Shaft, Glass Cathedral, and Sunken Foundry. Every biome has its own geometry, hazards, enemy roles, music, reward cadence, and three-phase Gate Guardian. At each basin, choose whether greed takes you deeper or whether it is time to shoulder the cache.
 
-Weight changes combat: a light explorer can rely on fast, invulnerable dodges, while a heavily loaded one must lean on precisely timed perfect blocks and high-risk parries. Loot balloons offer an emergency extraction at a steep value penalty.
+The ascent reverses all 15 rooms with a separate Collector roster. Burden shifts the player through Agile, Laden, and Crushing combat tiers; Crushing keeps its dodge but turns it into an offensive, poise-breaking shoulder. Loot Balloons remain a costly emergency extraction.
 
-Successful extractions award Grit for permanent Surface upgrades, including better balloon retention, encumbered stamina recovery, wider perfect-block timing, and new starting weapons. Progress is stored by the browser; clearing site data resets it.
+Four weapon systems—Chainblade, Rivet Repeater, Bell Maul, and Prism Rifle—have distinct resources and Techniques. Twenty run-changing Techniques, 12 mechanical cargo relics, Drive, escalating Attention, 22 enemy roles, and 12 permanent Surface upgrades create the run variety. Progress is stored by the browser; clearing site data resets it.
 
 ## Browser requirements
 
