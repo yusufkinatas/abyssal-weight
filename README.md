@@ -2,6 +2,10 @@
 
 A pixel-art vertical-extraction roguelite about descending light, choosing how deep greed takes you, and carrying your haul back through a much deadlier ascent.
 
+## Play online
+
+[Play Abyssal Weight on Vercel](https://abyssal-weight.vercel.app)
+
 ## Run locally
 
 No build step or package installation is required. From the project directory, run:
