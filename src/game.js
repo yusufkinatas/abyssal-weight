@@ -2,9 +2,9 @@ import {
   DEFAULT_META_V2,
   META_UPGRADES,
   WEAPONS,
-} from "./data.js?v=20260717-3";
-import { PixelRenderer, SaveStore, UiShell } from "./presentation.js?v=20260717-3";
-import { ActionRuntime } from "./runtime.js?v=20260717-3";
+} from "./data.js?v=20260718-1";
+import { PixelRenderer, SaveStore, UiShell } from "./presentation.js?v=20260718-1";
+import { ActionRuntime } from "./runtime.js?v=20260718-1";
 
 function clone(value) {
   return typeof structuredClone === "function"
@@ -225,6 +225,13 @@ export class AbyssalWeightGame {
     this.showHub();
   }
 
+  addTestGrit() {
+    this.meta.grit = Math.max(0, Number(this.meta.grit) || 0) + 10;
+    this.store.save(this.meta);
+    this.ui.toast("Testing grant · +10 Grit");
+    this.showHub();
+  }
+
   selectWeapon(id) {
     if (!this.meta.unlockedWeapons.includes(id) || !WEAPONS[id]) return;
     this.meta.selectedWeapon = id;
@@ -280,6 +287,7 @@ export class AbyssalWeightGame {
       case "enter-hub": this.showHub(); break;
       case "open-controls": this.showControls(); break;
       case "back-title": this.showTitle(); break;
+      case "add-test-grit": this.addTestGrit(); break;
       case "buy-upgrade": this.buyUpgrade(detail.id); break;
       case "select-weapon": this.selectWeapon(detail.id); break;
       case "start-run": this.startRun(); break;

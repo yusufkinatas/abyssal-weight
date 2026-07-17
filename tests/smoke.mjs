@@ -25,6 +25,7 @@ import {
 } from "../src/collision.js";
 import { NavGrid } from "../src/navigation.js";
 import { ActionRuntime } from "../src/runtime.js";
+import { AbyssalWeightGame } from "../src/game.js";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const tests = [];
@@ -514,6 +515,24 @@ test("room interaction is a defined, safe runtime action", () => {
   runtime.ui = { toast: (message) => messages.push(message) };
   runtime.interactWithRoom();
   deepEqual(messages, ["NO MECHANISM IN REACH"], "Empty-room interaction should fail safely with player feedback");
+});
+
+test("the Surface shop testing grant persists exactly 10 Grit", () => {
+  const game = Object.create(AbyssalWeightGame.prototype);
+  let savedGrit = null;
+  let refreshed = false;
+  let toast = "";
+  game.meta = { grit: 7 };
+  game.store = { save: (meta) => { savedGrit = meta.grit; } };
+  game.ui = { toast: (message) => { toast = message; } };
+  game.showHub = () => { refreshed = true; };
+
+  game.addTestGrit();
+
+  equal(game.meta.grit, 17, "Testing grant must add exactly 10 Grit");
+  equal(savedGrit, 17, "Testing grant must persist immediately");
+  assert(refreshed, "Testing grant must refresh the Surface shop");
+  assert(/\+10 Grit/.test(toast), "Testing grant should confirm the added currency");
 });
 
 let passed = 0;

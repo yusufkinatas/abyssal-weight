@@ -1,6 +1,6 @@
-import * as Content from "./data.js?v=20260717-3";
-import { ActionInput } from "./input.js?v=20260717-3";
-import { SeededRng } from "./rng.js?v=20260717-3";
+import * as Content from "./data.js?v=20260718-1";
+import { ActionInput } from "./input.js?v=20260718-1";
+import { SeededRng } from "./rng.js?v=20260718-1";
 import {
   TAU,
   angleBetween,
@@ -13,8 +13,8 @@ import {
   normalizeVector,
   segmentVsExpandedAABB,
   sweptProjectileHit,
-} from "./collision.js?v=20260717-3";
-import { NavAgentState, NavGrid } from "./navigation.js?v=20260717-3";
+} from "./collision.js?v=20260718-1";
+import { NavAgentState, NavGrid } from "./navigation.js?v=20260718-1";
 
 const WORLD = Content.BASE_WORLD;
 const FIXED_STEP = 1 / 60;
