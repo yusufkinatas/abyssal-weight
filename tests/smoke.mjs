@@ -517,7 +517,7 @@ test("room interaction is a defined, safe runtime action", () => {
   deepEqual(messages, ["NO MECHANISM IN REACH"], "Empty-room interaction should fail safely with player feedback");
 });
 
-test("the Surface shop testing grant persists exactly 10 Grit", () => {
+test("the Surface shop exposes persistent Grit and unlock-all testing cheats", () => {
   const game = Object.create(AbyssalWeightGame.prototype);
   let savedGrit = null;
   let refreshed = false;
@@ -527,12 +527,29 @@ test("the Surface shop testing grant persists exactly 10 Grit", () => {
   game.ui = { toast: (message) => { toast = message; } };
   game.showHub = () => { refreshed = true; };
 
-  game.addTestGrit();
+  game.grantTestGrit();
 
-  equal(game.meta.grit, 17, "Testing grant must add exactly 10 Grit");
-  equal(savedGrit, 17, "Testing grant must persist immediately");
+  equal(game.meta.grit, 1006, "Testing grant must add exactly 999 Grit");
+  equal(savedGrit, 1006, "Testing grant must persist immediately");
   assert(refreshed, "Testing grant must refresh the Surface shop");
-  assert(/\+10 Grit/.test(toast), "Testing grant should confirm the added currency");
+  assert(/\+999 Grit/.test(toast), "Testing grant should confirm the added currency");
+
+  game.meta = { grit: 0, upgrades: {}, unlockedWeapons: ["chainblade"], selectedWeapon: "chainblade" };
+  savedGrit = null;
+  refreshed = false;
+  game.unlockAllUpgradesForTesting();
+
+  for (const upgrade of Object.values(META_UPGRADES)) {
+    equal(game.meta.upgrades[upgrade.id], upgrade.maxRank, `${upgrade.id} must be maxed by the testing cheat`);
+    for (const effect of upgrade.effects || []) {
+      if (effect.type === "unlock_weapon") {
+        assert(game.meta.unlockedWeapons.includes(effect.id), `${effect.id} must unlock with all upgrades`);
+      }
+    }
+  }
+  equal(savedGrit, 0, "Unlock-all must persist without altering Grit");
+  assert(refreshed, "Unlock-all must refresh the Surface shop");
+  assert(/all permanent upgrades unlocked/i.test(toast), "Unlock-all should confirm completion");
 });
 
 let passed = 0;

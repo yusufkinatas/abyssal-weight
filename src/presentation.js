@@ -816,7 +816,8 @@ export class UiShell {
       ${upgradeCards ? `<div class="upgrade-grid" aria-label="Permanent upgrades">${upgradeCards}</div>` : ''}
       <div class="screen-actions">
         ${commandButton('DESCEND', 'start-run')}
-        ${commandButton('ADD 10 GRIT · TEST', 'add-test-grit', { className: 'secondary' })}
+        ${commandButton('GET 999 GRIT · TEST', 'grant-test-grit', { className: 'secondary' })}
+        ${commandButton('UNLOCK ALL UPGRADES · TEST', 'unlock-test-upgrades', { className: 'secondary' })}
         ${commandButton('TITLE', 'back-title', { className: 'secondary' })}
       </div>
     `);

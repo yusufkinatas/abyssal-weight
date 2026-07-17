@@ -2,9 +2,9 @@ import {
   DEFAULT_META_V2,
   META_UPGRADES,
   WEAPONS,
-} from "./data.js?v=20260718-1";
-import { PixelRenderer, SaveStore, UiShell } from "./presentation.js?v=20260718-1";
-import { ActionRuntime } from "./runtime.js?v=20260718-1";
+} from "./data.js?v=20260718-2";
+import { PixelRenderer, SaveStore, UiShell } from "./presentation.js?v=20260718-2";
+import { ActionRuntime } from "./runtime.js?v=20260718-2";
 
 function clone(value) {
   return typeof structuredClone === "function"
@@ -225,10 +225,20 @@ export class AbyssalWeightGame {
     this.showHub();
   }
 
-  addTestGrit() {
-    this.meta.grit = Math.max(0, Number(this.meta.grit) || 0) + 10;
+  grantTestGrit() {
+    this.meta.grit = Math.max(0, Number(this.meta.grit) || 0) + 999;
     this.store.save(this.meta);
-    this.ui.toast("Testing grant · +10 Grit");
+    this.ui.toast("Testing grant · +999 Grit");
+    this.showHub();
+  }
+
+  unlockAllUpgradesForTesting() {
+    this.meta.upgrades ||= {};
+    for (const upgrade of Object.values(META_UPGRADES)) {
+      this.meta.upgrades[upgrade.id] = upgrade.maxRank;
+    }
+    this.repairUnlocks();
+    this.ui.toast("Testing grant · all permanent upgrades unlocked");
     this.showHub();
   }
 
@@ -287,7 +297,8 @@ export class AbyssalWeightGame {
       case "enter-hub": this.showHub(); break;
       case "open-controls": this.showControls(); break;
       case "back-title": this.showTitle(); break;
-      case "add-test-grit": this.addTestGrit(); break;
+      case "grant-test-grit": this.grantTestGrit(); break;
+      case "unlock-test-upgrades": this.unlockAllUpgradesForTesting(); break;
       case "buy-upgrade": this.buyUpgrade(detail.id); break;
       case "select-weapon": this.selectWeapon(detail.id); break;
       case "start-run": this.startRun(); break;

@@ -16,7 +16,7 @@ import {
   isPointValid,
   normalizeRect,
   normalizeVector,
-} from "./collision.js?v=20260718-1";
+} from "./collision.js?v=20260718-2";
 
 const ORTHOGONAL_COST = 10;
 const DIAGONAL_COST = 14;
