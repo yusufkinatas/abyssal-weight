@@ -24,8 +24,11 @@ import {
   sweptProjectileHit,
 } from "../src/collision.js";
 import { NavGrid } from "../src/navigation.js";
-import { ActionRuntime } from "../src/runtime.js";
+import { ActionInput } from "../src/input.js";
+import * as RuntimeCombat from "../src/runtime.js";
 import { AbyssalWeightGame } from "../src/game.js";
+
+const { ActionRuntime } = RuntimeCombat;
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const tests = [];
@@ -465,6 +468,408 @@ test("circle collision preserves tangential motion while blocking penetration", 
     { x: 55, y: 50, r: 4 },
   );
   assert(swept && swept.t > 0 && swept.t < 1, "Fast projectiles need swept collision hits");
+});
+
+test("same-frame technique intent wins without primary overwriting the action", () => {
+  const buffered = new Set(["secondary", "primary"]);
+  const actionStarts = [];
+  const runtime = Object.create(ActionRuntime.prototype);
+  runtime.time = 1;
+  runtime.meta = {
+    upgrades: {},
+    statistics: { peakDrive: 0 },
+  };
+  runtime.run = {
+    phase: "descent",
+    weaponId: "chainblade",
+    techniques: [],
+    cargo: [],
+    carriedWeight: 0,
+    alternatingStacks: 0,
+    alternatingTimer: 0,
+    player: {
+      x: 160,
+      y: 90,
+      r: 3.6,
+      vx: 0,
+      vy: 0,
+      aim: 0,
+      lastMove: { x: 1, y: 0 },
+      invuln: 0,
+      dashCooldown: 0,
+      deflectCooldown: 0,
+      deflectTime: 0,
+      techniqueCooldown: 0,
+      combo: 0,
+      comboTimer: 0,
+      drive: 0,
+      driveIdle: 0,
+      empowered: 0,
+      empoweredCharges: 0,
+      hurtTime: 0,
+      lienWeight: 0,
+      status: {},
+      ammo: Infinity,
+      reload: 0,
+      dashTime: 0,
+      relicCooldown: 0,
+      mirrorCooldown: 0,
+      flywheelCooldown: 0,
+      impactCharge: 0,
+      action: null,
+    },
+  };
+  runtime.encounter = {
+    biome: BIOMES[0],
+    bounds: BASE_WORLD.bounds,
+    hazards: [],
+    obstacles: [],
+    barriers: [],
+    effects: [],
+    enemies: [],
+    projectiles: [],
+  };
+  runtime.input = {
+    pointer: { active: false, x: 160, y: 90 },
+    consume(action) {
+      if (!buffered.has(action)) return false;
+      buffered.delete(action);
+      return true;
+    },
+    held: () => false,
+  };
+  runtime.movePlayer = () => {};
+  runtime.beginPlayerAction = (type) => {
+    actionStarts.push(type);
+    runtime.run.player.action = { type };
+  };
+
+  runtime.updatePlayer(1 / 60);
+
+  deepEqual(actionStarts, ["technique"], "Primary intent must not replace a technique started in the same simulation step");
+  const queuedPrimary = runtime.run.player.actionQueue?.type === "primary";
+  assert(buffered.has("primary") || queuedPrimary,
+    "Lower-priority primary intent should remain buffered or queued for the next legal action window");
+});
+
+test("hitstop freezes simulation without consuming buffered combat input", () => {
+  const input = {
+    remaining: 0.05,
+    tickCalls: 0,
+    endCalls: 0,
+    tick(dt) {
+      this.tickCalls += 1;
+      this.remaining = Math.max(0, this.remaining - dt);
+    },
+    consume: () => false,
+    endStep() {
+      this.endCalls += 1;
+    },
+  };
+  const runtime = Object.create(ActionRuntime.prototype);
+  runtime.time = 0;
+  runtime.metrics = { frames: 0 };
+  runtime.input = input;
+  runtime.run = {};
+  runtime.encounter = { particles: [] };
+  runtime.bot = { enabled: false };
+  runtime.scene = "playing";
+  runtime.hitstop = 3;
+
+  runtime.step(1 / 60);
+  runtime.step(1 / 60);
+  runtime.step(1 / 60);
+
+  equal(input.remaining, 0.05, "Buffered input lifetime must not elapse while combat simulation is frozen");
+  equal(input.tickCalls, 0, "ActionInput.tick must run only on a non-hitstop simulation step");
+  equal(input.endCalls, 3, "Hitstop steps must still close transient raw-input bookkeeping");
+  equal(runtime.hitstop, 0, "An authored three-frame hitstop must freeze exactly three fixed steps");
+});
+
+test("combat cancels unlock after the active beat and utility inputs are not banked across focus loss", () => {
+  const runtime = Object.create(ActionRuntime.prototype);
+  runtime.time = 10;
+  runtime.run = {
+    player: {
+      action: {
+        phase: "startup",
+        startedAt: 9.8,
+        part: { cancels: { dashAfterActive: true, deflectAfter: 0.08 } },
+      },
+    },
+  };
+  assert(!runtime.canCancelPlayerAction("dodge"), "Dodge must not skip an attack startup that already committed resources");
+  assert(!runtime.canCancelPlayerAction("deflect"), "Deflect must not skip an attack startup that already committed resources");
+  runtime.run.player.action.phase = "active";
+  assert(runtime.canCancelPlayerAction("dodge"), "An authored dash-after-active cancel must unlock on the active beat");
+  assert(runtime.canCancelPlayerAction("deflect"), "An elapsed authored deflect cancel must unlock after startup");
+
+  const input = Object.create(ActionInput.prototype);
+  input.downCodes = new Set(["KeyJ"]);
+  input.virtualHeld = new Set(["primary"]);
+  input.buffers = new Map([["primary", 0.16]]);
+  input.pointer = { left: true, right: false };
+  input.resetHeld();
+  equal(input.buffers.size, 0, "Focus loss and scene boundaries must discard phantom combat inputs");
+});
+
+test("enemy tells lock the same geometry their attacks resolve", () => {
+  const previousWindow = globalThis.window;
+  globalThis.window = {};
+  try {
+    const runtime = Object.create(ActionRuntime.prototype);
+    runtime.time = 4;
+    runtime.ui = {};
+    runtime.run = {
+      weaponId: "repeater",
+      phase: "ascent",
+      roomIndex: 10,
+      cargo: [],
+      player: { x: 20, y: 20, r: 3.6, vx: 0, vy: 0 },
+      rng: {
+        pick: (entries) => entries[0],
+        weighted: (entries) => entries[0],
+        chance: () => true,
+        int: () => 0,
+        range: () => 0,
+        shuffle: (entries) => [...entries],
+      },
+    };
+    runtime.encounter = {
+      attackTokensUsed: 0,
+      attackTokenCap: 6,
+      barriers: [],
+      obstacles: [],
+      effects: [],
+      enemies: [],
+      bounds: BASE_WORLD.bounds,
+      spawnPoints: [{ x: 50, y: 50 }],
+      nav: {
+        projectToWalkable: (point) => ({ ...point }),
+        hasLineOfSight: () => true,
+      },
+    };
+    runtime.rebuildNavigation = () => {};
+    runtime.collisionObstacles = () => [];
+
+    const skitter = {
+      id: "mire_skitter",
+      def: ENEMIES.mire_skitter,
+      boss: false,
+      x: 10,
+      y: 20,
+      r: ENEMIES.mire_skitter.radius,
+      vx: 0,
+      vy: 0,
+    };
+    runtime.tryEnemyAttack(skitter);
+    equal(skitter.state, "tell", "Ordinary enemy attack selection must enter a tell without throwing");
+    assert(skitter.attackTimeline.active >= skitter.attack.repeatDelay,
+      "A paired pounce tell must account for the whole swept active window");
+
+    const confiscator = {
+      def: { speed: 30 },
+      attack: { pattern: "steal_then_flee", speed: 110 },
+      aim: Math.PI / 2,
+      vx: 77,
+      vy: -99,
+    };
+    runtime.beginEnemyActive(confiscator);
+    assert(Math.abs(confiscator.vx) < 1e-8 && confiscator.vy > 109,
+      "A charge tell must initialize both velocity axes instead of inheriting stale steering");
+
+    const copyAttack = ENEMIES.counterfeit.attacks[0];
+    const counterfeit = { id: "counterfeit", def: ENEMIES.counterfeit, x: 0, y: 20, r: 5.6 };
+    runtime.startEnemyAttack(counterfeit, copyAttack, 2);
+    equal(counterfeit.copiedWeaponId, "repeater", "Copied geometry must lock the player's weapon at tell start");
+    assert(counterfeit.attackTimeline.tell >= copyAttack.replayDelay,
+      "The authored replay delay must remain part of the readable tell");
+    runtime.run.weaponId = "chainblade";
+    let copiedFan = 0;
+    runtime.enemyFan = (_enemy, _attack, count) => { copiedFan = count; };
+    runtime.updateEnemyActive(counterfeit, 1 / 60);
+    equal(copiedFan, 3, "Swapping during a copied ranged tell must not silently turn it into a melee cone");
+
+    const wallAttack = ENEMIES.root_notary.attacks.find((attack) => attack.pattern === "barrier_cross");
+    const notary = { id: "root_notary", def: ENEMIES.root_notary, x: 5, y: 5, r: 7 };
+    runtime.run.player.x = 32;
+    runtime.run.player.y = 42;
+    runtime.startEnemyAttack(notary, wallAttack, 2);
+    const warnedWall = { ...notary.barrierRects[0] };
+    runtime.run.player.x = 200;
+    runtime.run.player.y = 130;
+    runtime.updateEnemyActive(notary, 1 / 60);
+    deepEqual(
+      { x: runtime.encounter.barriers[0].x, y: runtime.encounter.barriers[0].y, w: runtime.encounter.barriers[0].w, h: runtime.encounter.barriers[0].h },
+      warnedWall,
+      "A solid barrier must resolve exactly where its tell was drawn",
+    );
+
+    runtime.spawnBurst = () => {};
+    runtime.encounter.spawnPoints = [{ x: 64, y: 48 }, { x: 220, y: 120 }];
+    runtime.encounter.nav.projectToWalkable = (point) => ({ x: point.x + 2, y: point.y + 3 });
+    const stepAttack = BOSSES.glass_saint.phases[1].patternDeck.find((attack) => /glass_step/.test(attack.pattern));
+    const saint = { id: "glass_saint", def: BOSSES.glass_saint, boss: true, x: 120, y: 80, r: 9 };
+    runtime.startEnemyAttack(saint, stepAttack, 3);
+    const warnedStep = { ...saint.stepAnchors[0] };
+    runtime.encounter.nav.projectToWalkable = () => ({ x: 999, y: 999 });
+    runtime.beginEnemyActive(saint);
+    deepEqual({ x: saint.x, y: saint.y }, warnedStep,
+      "Glass Step must teleport to its preprojected warning anchor even if navigation changes during the tell");
+
+    const jabAttack = ENEMIES.shardling.attacks[0];
+    const shardling = {
+      id: "shardling",
+      def: ENEMIES.shardling,
+      x: 100,
+      y: 80,
+      r: ENEMIES.shardling.radius,
+      side: 1,
+    };
+    runtime.startEnemyAttack(shardling, jabAttack, 1);
+    const warnedJab = { ...shardling.jabOrigin };
+    runtime.beginEnemyActive(shardling);
+    for (const elapsed of [0, jabAttack.sidestepTime, jabAttack.sidestepTime * 2]) {
+      shardling.stateTime = shardling.attackTimeline.active - elapsed;
+      runtime.updateEnemyActive(shardling, 1 / 60);
+    }
+    deepEqual({ x: shardling.x, y: shardling.y }, warnedJab,
+      "Sidestep Jab must finish at the origin of the cone shown during its tell");
+
+    runtime.metrics = { projectilesSpawned: 0 };
+    runtime.encounter.projectiles = [];
+    const fanAttack = ENEMIES.mire_spitter.attacks[0];
+    ActionRuntime.prototype.enemyAimedShot.call(runtime, {
+      def: ENEMIES.mire_spitter,
+      x: 0,
+      y: 0,
+      r: ENEMIES.mire_spitter.radius,
+    }, fanAttack, 0);
+    const warnedProjectile = runtime.encounter.projectiles[0];
+    assert(Math.abs(
+      warnedProjectile.life * fanAttack.projectileSpeed + ENEMIES.mire_spitter.radius + 2 - fanAttack.range,
+    ) < 1e-8,
+      "A hostile projectile must expire at the range its tell advertised");
+
+    const hookAttack = ENEMIES.root_notary.attacks.find((attack) => attack.pattern === "hook_pull_slam");
+    const hooker = {
+      id: "root_notary",
+      def: ENEMIES.root_notary,
+      attack: hookAttack,
+      attackTimeline: { active: hookAttack.active },
+      stateTime: hookAttack.active,
+      activeResolved: false,
+      aim: 0,
+      x: 0,
+      y: 0,
+      r: 7,
+    };
+    let hookOptions = null;
+    runtime.enemyAimedShot = (_enemy, _attack, _angle, options) => { hookOptions = options; };
+    runtime.updateEnemyActive(hooker, 1 / 60);
+    equal(hookOptions?.kind, "tether", "The Notary hook must resolve as its telegraphed projectile, not a giant melee cone");
+    equal(hookOptions?.maxDistance, hookAttack.range, "The hook projectile must stop at its telegraphed range");
+    equal(hookOptions?.pullDistance, hookAttack.pullDistance, "A landed hook must preserve its authored pull distance");
+
+    runtime.encounter.projectiles = [];
+    runtime.spawnProjectile({ x: 0, y: 0, vx: 1, vy: 0, pullDistance: hookAttack.pullDistance });
+    equal(runtime.encounter.projectiles[0].pullDistance, hookAttack.pullDistance,
+      "Projectile storage must not discard the hook's authored pull distance before collision");
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
+});
+
+test("player knockback always travels away from the incoming source", () => {
+  equal(typeof ActionRuntime.prototype.applyPlayerKnockback, "function", "ActionRuntime must expose applyPlayerKnockback for a single direction contract");
+  const runtime = Object.create(ActionRuntime.prototype);
+  runtime.run = { player: { x: 40, y: 50 } };
+  const movements = [];
+  runtime.movePlayer = (dx, dy) => movements.push({ dx, dy });
+
+  runtime.applyPlayerKnockback({ source: { x: 10, y: 50 }, angle: 0 }, 8);
+  runtime.applyPlayerKnockback({ source: { x: 40, y: 20 } }, 6);
+
+  assert(movements[0].dx > 0 && Math.abs(movements[0].dy) < 1e-9,
+    `A hit arriving left-to-right must push right, received ${JSON.stringify(movements[0])}`);
+  assert(movements[1].dy > 0 && Math.abs(movements[1].dx) < 1e-9,
+    `A source above the player must push down, received ${JSON.stringify(movements[1])}`);
+});
+
+test("the victory beat cannot be stolen by lingering hostile damage", () => {
+  const runtime = Object.create(ActionRuntime.prototype);
+  runtime.bot = { god: false };
+  runtime.run = { player: { hp: 20 } };
+  runtime.encounter = { clear: false, boss: { dead: true } };
+
+  equal(runtime.damagePlayer(999, { kind: "hazard" }), false,
+    "Boss death must immediately close the damage exchange");
+  equal(runtime.run.player.hp, 20, "A lingering boss hazard must not damage the player after the killing blow");
+
+  runtime.encounter = { clear: true, boss: null };
+  equal(runtime.damagePlayer(999, { kind: "projectile" }), false,
+    "Projectiles must become harmless during the room-clear beat");
+  equal(runtime.run.player.hp, 20, "A room-clear projectile must not steal the completed encounter");
+
+  runtime.encounter = {
+    clear: false,
+    boss: null,
+    waves: [{ groups: [] }],
+    waveIndex: 0,
+    enemies: [{ dead: true }],
+  };
+  equal(runtime.damagePlayer(999, { kind: "hazard" }), false,
+    "The last normal enemy's killing frame must close the exchange before updateEncounter runs");
+  equal(runtime.run.player.hp, 20, "A same-step hazard must not steal a cleared normal room");
+});
+
+test("player movement stays inside the combat-readable viewport", () => {
+  const runtime = Object.create(ActionRuntime.prototype);
+  runtime.run = { player: { x: 160, y: 90, r: 3.6, vx: 0, vy: 0 } };
+  runtime.encounter = { bounds: { x: 8, y: 12, w: 304, h: 160 } };
+  runtime.collisionObstacles = () => [];
+
+  runtime.movePlayer(0, -200);
+  assert(runtime.run.player.y >= 31.59,
+    `The delver must remain below the top HUD, received y=${runtime.run.player.y}`);
+  runtime.movePlayer(0, 300);
+  assert(runtime.run.player.y <= 152.41,
+    `The delver must remain above the loadout HUD, received y=${runtime.run.player.y}`);
+});
+
+test("melee and projectile deflects share one visible front-cone contract", () => {
+  const isWithinDeflectCone = RuntimeCombat.isWithinDeflectCone;
+  equal(typeof isWithinDeflectCone, "function", "runtime.js must export isWithinDeflectCone");
+  const player = { x: 100, y: 100, aim: 0 };
+  const sourceAt = (degrees, distance = 20) => ({
+    x: player.x + Math.cos(degrees * Math.PI / 180) * distance,
+    y: player.y + Math.sin(degrees * Math.PI / 180) * distance,
+  });
+
+  assert(isWithinDeflectCone(player, sourceAt(0)), "A source directly in front must be deflectable");
+  assert(isWithinDeflectCone(player, sourceAt(79)), "The authored 80-degree half-arc must include its visible inner edge");
+  assert(!isWithinDeflectCone(player, sourceAt(81)), "Sources just outside the 80-degree half-arc must not deflect");
+  assert(!isWithinDeflectCone(player, sourceAt(180)), "Rear attacks must not pass a front-facing deflect");
+  assert(isWithinDeflectCone(player, { ...player, vx: -100, vy: 0 }),
+    "An overlapping projectile traveling in from the front must use its incoming velocity");
+  assert(!isWithinDeflectCone(player, { ...player, vx: 100, vy: 0 }),
+    "An overlapping projectile traveling in from behind must not reflect through the front cone");
+  assert(isWithinDeflectCone(player, { x: 120, y: 100, vx: -100, vy: 0 }),
+    "A moving melee source must use its position, rather than accidentally inheriting projectile semantics");
+
+  const runtimeSource = read("src/runtime.js");
+  const sharedConeCalls = [...runtimeSource.matchAll(/\bisWithinDeflectCone\s*\(/g)].length;
+  assert(sharedConeCalls >= 3,
+    "The shared deflect helper must be used by both melee damage and projectile collision (definition + two call sites)");
+});
+
+test("the player renderer never regresses to the chest mimic tile", () => {
+  const runtimeSource = read("src/runtime.js");
+  const renderPlayerSource = runtimeSource.match(/\n  renderPlayer\(ctx\) \{([\s\S]*?)\n  snapshot\(\)/)?.[1] || "";
+  assert(renderPlayerSource.length > 0, "Unable to locate ActionRuntime.renderPlayer");
+  assert(!/\bsprite\s*:\s*92\b/.test(renderPlayerSource), "Tile 92 is the open chest mimic and must never represent the player");
+  assert(/\bsprite\s*:\s*PLAYER_SPRITE\b/.test(renderPlayerSource), "Player rendering must use the named humanoid PLAYER_SPRITE contract");
 });
 
 test("DOM and renderer sources enforce crisp, readable presentation", () => {

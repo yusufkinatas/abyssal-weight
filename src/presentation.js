@@ -347,6 +347,46 @@ export class PixelRenderer {
     return true;
   }
 
+  /**
+   * Draws a tile around a world-space center with opt-in pose transforms.
+   * Rotation is measured in radians. Translation and the unscaled sprite
+   * bounds stay on integer pixels so transformed pixel art remains crisp.
+   */
+  drawOrientedSprite(index, x, y, options = {}) {
+    if (!this.tileSheet || !this.assetsReady) return false;
+    const tile = clamp(integer(index), 0, TILE_COLUMNS * 11 - 1);
+    const sx = (tile % TILE_COLUMNS) * TILE_SIZE;
+    const sy = Math.floor(tile / TILE_COLUMNS) * TILE_SIZE;
+    const size = Math.max(1, Math.round(options.size ?? options.drawSize ?? TILE_SIZE));
+    const rotation = finite(options.rotation, 0);
+    const flip = options.flip ?? false;
+    const flipX = flip === true || flip === 'x' || flip?.x;
+    const flipY = flip === 'y' || flip?.y;
+    const scaleX = finite(options.scaleX, 1) * (flipX ? -1 : 1);
+    const scaleY = finite(options.scaleY, 1) * (flipY ? -1 : 1);
+    const cx = Math.round(finite(x));
+    const cy = Math.round(finite(y));
+
+    this.ctx.save();
+    this.ctx.imageSmoothingEnabled = false;
+    this.ctx.translate(cx, cy);
+    if (rotation) this.ctx.rotate(rotation);
+    this.ctx.scale(scaleX, scaleY);
+    this.ctx.drawImage(
+      this.tileSheet,
+      sx,
+      sy,
+      TILE_SIZE,
+      TILE_SIZE,
+      -Math.floor(size / 2),
+      -Math.floor(size / 2),
+      size,
+      size,
+    );
+    this.ctx.restore();
+    return true;
+  }
+
   drawEnvironmentTile(index, x, y, size = TILE_SIZE, alpha = 1) {
     if (!this.environmentSheet || !this.assetsReady) return false;
     const tile = clamp(integer(index), 0, ENVIRONMENT_COLUMNS * 31 - 1);
@@ -385,38 +425,74 @@ export class PixelRenderer {
     const entity = typeof entityOrTile === 'object' && entityOrTile !== null
       ? entityOrTile
       : { ...options, sprite: entityOrTile, x, y };
-    const cx = Math.round(entity.x ?? x ?? 0);
-    const cy = Math.round(entity.y ?? y ?? 0);
+    const worldX = finite(entity.x ?? x, 0);
+    const worldY = finite(entity.y ?? y, 0);
+    const anchorX = Math.round(worldX);
+    const anchorY = Math.round(worldY);
+    const cx = Math.round(worldX + finite(entity.offsetX, 0));
+    const cy = Math.round(worldY + finite(entity.offsetY, 0));
     const radius = finite(entity.radius ?? entity.r, 6);
     const size = Math.max(6, Math.round(entity.drawSize ?? entity.size ?? radius * 2.35));
     const sprite = entity.sprite ?? entity.tile ?? entity.tileIndex;
     const facing = finite(entity.facing ?? entity.angle, 0);
     const flip = entity.flip ?? (Math.cos(facing) < 0);
+    const rotation = finite(entity.rotation, 0);
+    const scaleX = finite(entity.scaleX, 1);
+    const scaleY = finite(entity.scaleY, 1);
+    const transformed = rotation !== 0 || scaleX !== 1 || scaleY !== 1;
     const alpha = clamp(finite(entity.alpha, 1), 0, 1);
     const color = entity.flashColor || entity.color || '#f4ead4';
 
     if (entity.shadow !== false) {
-      this.drawShadow(cx, cy + Math.floor(size * 0.37), size * 0.72, Math.max(2, size * 0.22), entity.shadowColor);
+      this.drawShadow(anchorX, anchorY + Math.floor(size * 0.37), size * 0.72, Math.max(2, size * 0.22), entity.shadowColor);
     }
 
     this.ctx.save();
     this.ctx.globalAlpha = alpha;
     const drawn = Number.isFinite(Number(sprite))
-      ? this.drawTile(sprite, cx - Math.floor(size / 2), cy - Math.floor(size / 2), size, flip)
+      ? transformed
+        ? this.drawOrientedSprite(sprite, cx, cy, { size, rotation, scaleX, scaleY, flip })
+        : this.drawTile(sprite, cx - Math.floor(size / 2), cy - Math.floor(size / 2), size, flip)
       : false;
     if (!drawn) {
       const body = Math.max(4, Math.round(size * 0.64));
-      this.ctx.fillStyle = color;
-      this.ctx.fillRect(cx - Math.floor(body / 2), cy - Math.floor(body / 2), body, body);
-      this.ctx.fillStyle = entity.detailColor || '#172026';
-      this.ctx.fillRect(cx + (flip ? -Math.floor(body / 2) : Math.floor(body / 2) - 2), cy - 1, 2, 2);
+      if (transformed) {
+        const flipX = flip === true || flip === 'x' || flip?.x;
+        const flipY = flip === 'y' || flip?.y;
+        this.ctx.save();
+        this.ctx.translate(cx, cy);
+        if (rotation) this.ctx.rotate(rotation);
+        this.ctx.scale(scaleX * (flipX ? -1 : 1), scaleY * (flipY ? -1 : 1));
+        this.ctx.fillStyle = color;
+        this.ctx.fillRect(-Math.floor(body / 2), -Math.floor(body / 2), body, body);
+        this.ctx.fillStyle = entity.detailColor || '#172026';
+        this.ctx.fillRect(Math.floor(body / 2) - 2, -1, 2, 2);
+        this.ctx.restore();
+      } else {
+        this.ctx.fillStyle = color;
+        this.ctx.fillRect(cx - Math.floor(body / 2), cy - Math.floor(body / 2), body, body);
+        this.ctx.fillStyle = entity.detailColor || '#172026';
+        this.ctx.fillRect(cx + (flip ? -Math.floor(body / 2) : Math.floor(body / 2) - 2), cy - 1, 2, 2);
+      }
     }
 
     if (entity.hitFlash || entity.invulnerableFlash) {
       this.ctx.globalAlpha = entity.hitFlash ? 0.78 : 0.45;
       this.ctx.fillStyle = entity.hitFlashColor || '#ffffff';
-      this.ctx.fillRect(cx - Math.floor(size * 0.28), cy - Math.floor(size * 0.34), Math.max(2, Math.floor(size * 0.56)), 2);
-      this.ctx.fillRect(cx - 1, cy - Math.floor(size * 0.35), 2, Math.max(3, Math.floor(size * 0.7)));
+      if (transformed) {
+        const flipX = flip === true || flip === 'x' || flip?.x;
+        const flipY = flip === 'y' || flip?.y;
+        this.ctx.save();
+        this.ctx.translate(cx, cy);
+        if (rotation) this.ctx.rotate(rotation);
+        this.ctx.scale(scaleX * (flipX ? -1 : 1), scaleY * (flipY ? -1 : 1));
+        this.ctx.fillRect(-Math.floor(size * 0.28), -Math.floor(size * 0.34), Math.max(2, Math.floor(size * 0.56)), 2);
+        this.ctx.fillRect(-1, -Math.floor(size * 0.35), 2, Math.max(3, Math.floor(size * 0.7)));
+        this.ctx.restore();
+      } else {
+        this.ctx.fillRect(cx - Math.floor(size * 0.28), cy - Math.floor(size * 0.34), Math.max(2, Math.floor(size * 0.56)), 2);
+        this.ctx.fillRect(cx - 1, cy - Math.floor(size * 0.35), 2, Math.max(3, Math.floor(size * 0.7)));
+      }
     }
     this.ctx.restore();
   }
@@ -936,6 +1012,8 @@ export class UiShell {
     this.e.hudLoot.textContent = formatCurrency(model.carriedValue ?? model.loot ?? model.carriedLoot ?? 0);
     this.e.hudWeaponName.textContent = String(weapon.name || model.weaponName || displayName(weapon.id || 'chainblade')).toUpperCase();
     this.e.hudWeaponAmmo.textContent = String(model.ammoText ?? weapon.ammoText ?? weapon.ammo ?? '∞');
+    this.e.hudLayer.classList.toggle('combat-near-top', Boolean(model.combatNearTop));
+    this.e.hudLayer.classList.toggle('combat-near-bottom', Boolean(model.combatNearBottom));
 
     const nodes = [...this.e.hudRouteNodes.children];
     while (nodes.length < 15) {
@@ -992,7 +1070,7 @@ export class UiShell {
     this._toastTimer = globalThis.setTimeout(() => {
       this.e.toastLayer.textContent = '';
       delete this.e.toastLayer.dataset.tone;
-    }, Math.max(400, finite(options.duration, 2200)));
+    }, Math.max(350, finite(options.duration, 1400)));
   }
 
   roomBanner(title, subtitle = '', duration = 1800) {

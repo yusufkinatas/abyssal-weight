@@ -2,9 +2,9 @@ import {
   DEFAULT_META_V2,
   META_UPGRADES,
   WEAPONS,
-} from "./data.js?v=20260718-2";
-import { PixelRenderer, SaveStore, UiShell } from "./presentation.js?v=20260718-2";
-import { ActionRuntime } from "./runtime.js?v=20260718-2";
+} from "./data.js?v=20260718-6";
+import { PixelRenderer, SaveStore, UiShell } from "./presentation.js?v=20260718-6";
+import { ActionRuntime } from "./runtime.js?v=20260718-6";
 
 function clone(value) {
   return typeof structuredClone === "function"
@@ -14,6 +14,7 @@ function clone(value) {
 
 function qaOptions() {
   const params = new URLSearchParams(location.search);
+  const requestedWeapon = params.get("weapon");
   return {
     bot: params.get("bot") === "1",
     god: params.get("god") === "1",
@@ -22,6 +23,7 @@ function qaOptions() {
     seed: params.get("seed") || null,
     room: Math.max(0, Math.min(14, Number(params.get("room")) || 0)),
     phase: params.get("phase") === "ascent" ? "ascent" : "descent",
+    weapon: WEAPONS[requestedWeapon] ? requestedWeapon : null,
   };
 }
 
@@ -131,7 +133,7 @@ export class AbyssalWeightGame {
     meta.shortcuts = [true, true, true];
     meta.unlockedWeapons = Object.keys(WEAPONS);
     meta.unlockedTechniques = [...new Set([...meta.unlockedTechniques, ...DEFAULT_META_V2.unlockedTechniques])];
-    meta.selectedWeapon = "repeater";
+    meta.selectedWeapon = this.qa.weapon || "repeater";
     meta.upgrades.field_rations = 2;
     meta.upgrades.dash_bearings = 2;
     meta.upgrades.reinforced_frame = 2;

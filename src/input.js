@@ -1,4 +1,6 @@
-const DEFAULT_BUFFER = 0.11;
+// Long enough to catch an intentional press near the end of a weapon recovery,
+// short enough that an old input never fires after the player has changed plans.
+const DEFAULT_BUFFER = 0.16;
 
 const KEY_ACTIONS = {
   KeyW: "up",
@@ -191,10 +193,15 @@ export class ActionInput {
     this.releasedActions.clear();
   }
 
+  clearBuffered() {
+    this.buffers.clear();
+  }
+
   resetHeld() {
     this.downCodes.clear();
     this.virtualHeld.clear();
     this.pointer.left = false;
     this.pointer.right = false;
+    this.clearBuffered();
   }
 }

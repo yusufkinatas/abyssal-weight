@@ -1,4 +1,4 @@
-import { AbyssalWeightGame } from "./src/game.js?v=20260718-2";
+import { AbyssalWeightGame } from "./src/game.js?v=20260718-6";
 
 window.addEventListener("DOMContentLoaded", async () => {
   const game = new AbyssalWeightGame();

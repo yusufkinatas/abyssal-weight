@@ -1,6 +1,6 @@
-import * as Content from "./data.js?v=20260718-2";
-import { ActionInput } from "./input.js?v=20260718-2";
-import { SeededRng } from "./rng.js?v=20260718-2";
+import * as Content from "./data.js?v=20260718-6";
+import { ActionInput } from "./input.js?v=20260718-6";
+import { SeededRng } from "./rng.js?v=20260718-6";
 import {
   TAU,
   angleBetween,
@@ -13,16 +13,20 @@ import {
   normalizeVector,
   segmentVsExpandedAABB,
   sweptProjectileHit,
-} from "./collision.js?v=20260718-2";
-import { NavAgentState, NavGrid } from "./navigation.js?v=20260718-2";
+} from "./collision.js?v=20260718-6";
+import { NavAgentState, NavGrid } from "./navigation.js?v=20260718-6";
 
 const WORLD = Content.BASE_WORLD;
 const FIXED_STEP = 1 / 60;
 const PLAYER_RADIUS = 3.6;
 const PLAYER_SPEED = 76;
-const PLAYER_DASH_SPEED = 196;
-const PLAYER_DASH_TIME = 0.145;
-const ENTRY_GRACE = 0.62;
+const PLAYER_DASH_SPEED = 200;
+const PLAYER_DASH_TIME = 0.14;
+const PLAYER_SPRITE = 100;
+const ENTRY_GRACE = 0.92;
+const DEFLECT_HALF_ARC = 80;
+const PLAYER_VIEWPORT_TOP = 28;
+const PLAYER_VIEWPORT_BOTTOM = 156;
 const COLORS = {
   player: "#f5e4bd",
   playerEdge: "#49321e",
@@ -68,18 +72,46 @@ function pointInCone(origin, angle, range, arc, target, extraRadius = 0) {
   return Math.abs(angleDiff(targetAngle, angle)) <= degrees(arc) / 2;
 }
 
+/**
+ * A shared facing contract for melee parries and projectile reflections.
+ * Projectile positions overlap the player at collision time, so their incoming
+ * velocity is used to recover the direction they came from.
+ */
+export function isWithinDeflectCone(player, source, halfArcDegrees = DEFLECT_HALF_ARC) {
+  if (!player || !source) return false;
+  const projectileLike = source.faction === "enemy"
+    || String(source.uid || "").startsWith("p:")
+    || distSq(player, source) < 0.0001;
+  const sourceAngle = projectileLike
+    && Number.isFinite(source.vx) && Number.isFinite(source.vy)
+    && Math.hypot(source.vx, source.vy) > 0.001
+    ? Math.atan2(source.vy, source.vx) + Math.PI
+    : angleBetween(player, source);
+  return Math.abs(angleDiff(sourceAngle, player.aim || 0)) <= degrees(halfArcDegrees);
+}
+
 function circleRectOverlap(circle, rect) {
   const x = clamp(circle.x, rect.x, rect.x + rect.w);
   const y = clamp(circle.y, rect.y, rect.y + rect.h);
   return (circle.x - x) ** 2 + (circle.y - y) ** 2 <= circle.r ** 2;
 }
 
+function playerViewportBounds(bounds) {
+  const top = Math.max(bounds.y, PLAYER_VIEWPORT_TOP);
+  const bottom = Math.min(bounds.y + bounds.h, PLAYER_VIEWPORT_BOTTOM);
+  return { x: bounds.x, y: top, w: bounds.w, h: Math.max(1, bottom - top) };
+}
+
 function audioCall(name, payload) {
   const audio = window.AbyssalAudio || window.abyssalAudio || window.audioEngine;
   try {
-    if (typeof audio?.playSfx === "function") audio.playSfx(name, payload);
-    else if (typeof audio?.sfx === "function") audio.sfx(name, payload);
-    else if (typeof audio?.play === "function") audio.play(name, payload);
+    const options = payload && typeof payload === "object" ? { ...payload } : {};
+    const x = Number(options.x);
+    delete options.x;
+    if (Number.isFinite(x) && typeof audio?.playAt === "function") audio.playAt(name, x, WORLD.w / 2, WORLD.w, options);
+    else if (typeof audio?.playSfx === "function") audio.playSfx(name, options);
+    else if (typeof audio?.sfx === "function") audio.sfx(name, options);
+    else if (typeof audio?.play === "function") audio.play(name, options);
   } catch {
     // Audio must never interrupt combat simulation.
   }
@@ -124,9 +156,9 @@ function cargoEffects(run, type) {
 
 function burdenTier(weight, capacity = 100) {
   const ratio = clamp(weight / Math.max(1, capacity), 0, 2);
-  if (ratio < 0.25) return { id: "agile", name: "AGILE", ratio, speed: 1, dashCooldown: 0.62, dashIFrames: 0.19 };
-  if (ratio < 0.75) return { id: "laden", name: "LADEN", ratio, speed: 0.96, dashCooldown: 0.70, dashIFrames: 0.17 };
-  return { id: "crushing", name: "CRUSHING", ratio, speed: 0.91, dashCooldown: 0.78, dashIFrames: 0.145 };
+  if (ratio < 0.25) return { id: "agile", name: "AGILE", ratio, speed: 1, dashCooldown: 0.50, dashIFrames: 0.18 };
+  if (ratio < 0.75) return { id: "laden", name: "LADEN", ratio, speed: 0.97, dashCooldown: 0.58, dashIFrames: 0.16 };
+  return { id: "crushing", name: "CRUSHING", ratio, speed: 0.93, dashCooldown: 0.68, dashIFrames: 0.145 };
 }
 
 function playerMaxHp(meta) {
@@ -212,12 +244,15 @@ function normalizeHazards(room, phase) {
   return [...shared, ...extra].map((hazard, index) => ({
     ...hazard,
     id: hazard.id || `${room.id}_hazard_${index}`,
-    timer: Number(hazard.offset) || index * 0.37,
+    timer: Number.isFinite(Number(hazard.offset))
+      ? Number(hazard.offset)
+      : Number.isFinite(Number(hazard.phase)) ? 0 : index * 0.37,
     activeDuration: typeof hazard.active === "number" ? hazard.active : null,
     active: false,
     hitTimer: 0,
     cooldownTimer: 0,
     disabledTimer: 0,
+    travelled: 0,
     hits: 0,
     alive: true,
     enemyHits: new Map(),
@@ -233,24 +268,31 @@ function spawnPointList(room, phase) {
   return points.map((point) => ({ x: point.x, y: point.y }));
 }
 
+function enemySpawnMaterializeTime(def) {
+  if (def?.elite) return 0.68;
+  return 0.48;
+}
+
 function attackTimeline(attack) {
   const pattern = attack.pattern || "";
   let authoredActive = Number(attack.active) || 0.10;
   if (/thorn_lash/.test(pattern)) authoredActive = Math.max(authoredActive, ((attack.swipes || 3) - 1) * (attack.interval || 0.15) + 0.09);
   if (/aimed_burst|predictive_pair|clone_lances|mirrored_ricochet_pair|rivet_fan|seed_mortar|crucible_toss/.test(pattern)) {
-    const count = attack.count || (pattern.includes("pair") ? 2 : 3);
+    const count = attack.count || attack.lanes || (pattern.includes("pair") ? 2 : 3);
     authoredActive = Math.max(authoredActive, (count - 1) * (attack.interval || 0.11) + 0.09);
   }
   if (/glass_step/.test(pattern)) authoredActive = Math.max(authoredActive, (attack.repeats || 1) * (attack.repeatDelay || 0.32) + 0.10);
   if (/halo_burst/.test(pattern)) authoredActive = Math.max(authoredActive, ((attack.rings || 2) - 1) * (attack.ringDelay || 0.28) + 0.10);
   if (/root_wall_wave/.test(pattern)) authoredActive = Math.max(authoredActive, ((attack.waves || 2) - 1) * (attack.interval || 0.30) + 0.10);
   if (/hammer_combo_ring/.test(pattern)) authoredActive = Math.max(authoredActive, (attack.strikes || 3) * (attack.interval || 0.30) + 0.10);
+  if (/king_hammer_rail|hammer_line_then_cross/.test(pattern)) authoredActive = Math.max(authoredActive, (attack.crossDelay || 0.20) + 0.09);
   if (/pounce_pair/.test(pattern)) authoredActive = Math.max(authoredActive, (attack.repeatDelay || 0.16) + 0.13);
   if (/stepped_shield_bash/.test(pattern)) authoredActive = Math.max(authoredActive, (attack.advanceBeats || 3) * 0.09);
   if (/sidestep_jab/.test(pattern)) authoredActive = Math.max(authoredActive, (attack.sidesteps || 3) * (attack.sidestepTime || 0.12) + 0.06);
   if (/charge|leap|pounce|rush/.test(pattern)) authoredActive = Math.max(authoredActive, Math.min(0.85, (attack.range || 70) / (attack.speed || 130)));
+  const heavyTell = /mortar|barrier|cage|beam|hammer|bellows|charge|slam|ring|fan/.test(pattern);
   return {
-    tell: Math.max(0.12, Number(attack.tell) || 0.24),
+    tell: Math.max(heavyTell ? 0.28 : 0.22, Number(attack.tell) || 0.26),
     active: Math.max(0.03, authoredActive),
     recovery: Math.max(0.15, Number(attack.recovery) || 0.42),
   };
@@ -281,6 +323,7 @@ export class ActionRuntime {
     this.accumulator = 0;
     this.hitstop = 0;
     this.shake = 0;
+    this.impactFlash = 0;
     this.lastFrame = performance.now();
     this.hudTimer = 0;
     this.transitionTimer = 0;
@@ -367,8 +410,11 @@ export class ActionRuntime {
         dashDir: { x: 0, y: -1 },
         dashSerial: 0,
         deflectTime: 0,
+        deflectPerfectTime: 0,
+        deflectSuccess: 0,
         deflectCooldown: 0,
         action: null,
+        actionQueue: null,
         techniqueCooldown: 0,
         ammo: Content.WEAPONS[safeWeapon]?.resource?.capacity ?? Infinity,
         reload: 0,
@@ -385,6 +431,9 @@ export class ActionRuntime {
         impactCharge: 0,
         empoweredCharges: 0,
         flywheelCooldown: 0,
+        recoil: 0,
+        hurtTime: 0,
+        stepTimer: 0,
       },
     };
     this.meta.runs = (this.meta.runs || 0) + 1;
@@ -423,6 +472,9 @@ export class ActionRuntime {
     player.vy = 0;
     player.invuln = ENTRY_GRACE;
     player.action = null;
+    player.actionQueue = null;
+    player.dashTime = 0;
+    player.deflectTime = 0;
     const projectedRoom = { x: player.x, y: player.y, r: player.r };
     for (const obstacle of obstacles) {
       if (circleRectOverlap(projectedRoom, obstacle)) {
@@ -448,7 +500,7 @@ export class ActionRuntime {
       spawnPoints,
       waves: waveList(room, phase),
       waveIndex: -1,
-      waveDelay: 0.35,
+      waveDelay: 0.55,
       enemies: [],
       projectiles: [],
       effects: [],
@@ -460,9 +512,11 @@ export class ActionRuntime {
       clear: false,
       clearTimer: 0,
       attackTokensUsed: 0,
-      attackTokenCap: phase === "ascent" ? 4 : 3,
+      attackTokenCap: phase === "ascent" ? 3 : this.run.roomIndex < 4 ? 2 : 3,
       attention: phase === "ascent" ? 20 : 0,
       hunterSpawned: false,
+      hunterCooldown: 0,
+      lastMaterializeTime: -Infinity,
       roomDamage: 0,
       roomKills: 0,
       firstDriveHealUsed: false,
@@ -482,7 +536,8 @@ export class ActionRuntime {
     this.scene = "playing";
     this.ui.showHud?.(true);
     this.ui.hideScreen?.();
-    this.spawnNextWave();
+    // The room gets a short readable settle beat before silhouettes materialize.
+    // updateEncounter owns the first spawn so authored wave.delay is honored.
   }
 
   rebuildNavigation() {
@@ -528,7 +583,7 @@ export class ActionRuntime {
     encounter.waveActive = true;
     const groups = wave.groups || [];
     if (groups.length === 0 && wave.boss) {
-      this.spawnBoss(wave.boss);
+      this.spawnBoss(wave.boss, wave.point || wave.position || wave.points?.[0]);
       return;
     }
     groups.forEach((group, groupIndex) => {
@@ -537,7 +592,7 @@ export class ActionRuntime {
         return;
       }
       if (group.boss) {
-        this.spawnBoss(group.boss);
+        this.spawnBoss(group.boss, group.point || group.position || group.points?.[0]);
         return;
       }
       const enemyId = group.enemy || group.id || group.type;
@@ -587,14 +642,18 @@ export class ActionRuntime {
     const pool = preferredPool || enemyPoolFor(this.run.roomIndex, this.run.phase);
     let remaining = budget;
     let guard = 0;
+    let spawned = 0;
     while (remaining > 0 && guard < 20 && pool.length) {
       guard += 1;
       const affordable = pool.filter((entry) => (entry.threatCost || 1) <= remaining);
-      const def = this.run.rng.pick(affordable.length ? affordable : pool);
+      if (!affordable.length) break;
+      const def = this.run.rng.pick(affordable);
       const point = this.run.rng.pick(this.encounter.spawnPoints);
       this.spawnEnemy(def.id, { x: point.x + this.run.rng.range(-4, 4), y: point.y + this.run.rng.range(-4, 4) });
+      spawned += 1;
       remaining -= def.threatCost || 1;
     }
+    return spawned;
   }
 
   spawnEnemy(id, point, options = {}) {
@@ -616,14 +675,17 @@ export class ActionRuntime {
       poise: def.poise || 30,
       maxPoise: def.poise || 30,
       state: "enter",
-      stateTime: 0.22,
-      cooldown: this.run.rng.range(0.10, 0.45),
+      stateTime: enemySpawnMaterializeTime(def),
+      cooldown: this.run.rng.range(0.52, 0.78),
       attack: null,
       aim: angleBetween(point, this.run.player),
       activeResolved: false,
       shotsFired: 0,
       tokenHeld: 0,
       flash: 0,
+      hitReaction: 0,
+      hitAngle: 0,
+      hitKick: 0,
       stagger: 0,
       dead: false,
       boss: false,
@@ -638,14 +700,16 @@ export class ActionRuntime {
       trailTimer: 0,
     };
     this.encounter.enemies.push(enemy);
+    this.encounter.lastMaterializeTime = this.encounter.time;
     this.meta.bestiarySeen = Array.from(new Set([...(this.meta.bestiarySeen || []), id]));
     return enemy;
   }
 
-  spawnBoss(id) {
+  spawnBoss(id, authoredPoint = null) {
     const def = Content.BOSSES[id];
     if (!def) return;
-    const point = phaseRoomSpec(this.encounter.room, "descent").bossPoint
+    const point = authoredPoint
+      || phaseRoomSpec(this.encounter.room, "descent").bossPoint
       || this.encounter.room.bossPoint
       || { x: WORLD.w / 2, y: 55 };
     const enemy = this.spawnEnemyFromBoss(def, point);
@@ -700,6 +764,7 @@ export class ActionRuntime {
       hitBy: new Set(),
     };
     this.encounter.enemies.push(enemy);
+    this.encounter.lastMaterializeTime = this.encounter.time;
     this.activateBossPhase(enemy);
     return enemy;
   }
@@ -718,8 +783,8 @@ export class ActionRuntime {
   step(dt) {
     this.time += dt;
     this.metrics.frames += 1;
-    this.input.tick(dt);
     if (!this.run || !this.encounter) {
+      this.input.tick(dt);
       this.input.endStep();
       return;
     }
@@ -738,17 +803,19 @@ export class ActionRuntime {
       this.onMetaChanged(this.meta);
     }
     if (this.scene !== "playing") {
+      this.input.clearBuffered?.();
       this.input.endStep();
       return;
     }
 
     if (this.hitstop > 0) {
-      this.hitstop -= dt;
+      this.hitstop -= 1;
       this.updateCosmetics(dt * 0.25);
       this.input.endStep();
       return;
     }
 
+    this.input.tick(dt);
     const encounter = this.encounter;
     encounter.time += dt;
     this.hudTimer -= dt;
@@ -786,11 +853,41 @@ export class ActionRuntime {
     this.canvas.focus({ preventScroll: true });
   }
 
+  addHitstop(frames = 1, flash = 0) {
+    this.hitstop = Math.max(this.hitstop, Math.max(0, Math.ceil(frames)));
+    this.impactFlash = Math.max(this.impactFlash, flash);
+  }
+
+  queuePlayerAction(type, seconds = 0.16) {
+    const player = this.run.player;
+    player.actionQueue = { type, time: seconds, weaponId: this.run.weaponId };
+  }
+
+  canCancelPlayerAction(utility) {
+    const action = this.run.player.action;
+    if (!action) return true;
+    // Resource costs commit at action start. Cancels therefore unlock only
+    // once the attack has reached its active beat, never during startup.
+    if (action.phase === "startup") return false;
+    const cancels = action.part?.cancels || action.payload?.cancels || {};
+    const startedAt = Number.isFinite(action.startedAt) ? action.startedAt : this.time;
+    const elapsed = Math.max(0, this.time - startedAt);
+    if (utility === "dodge") {
+      return Boolean(cancels.dashAfterActive)
+        || (Number.isFinite(cancels.dashAfter) && elapsed >= cancels.dashAfter);
+    }
+    if (utility === "deflect") {
+      return Boolean(cancels.deflectAfterActive)
+        || (Number.isFinite(cancels.deflectAfter) && elapsed >= cancels.deflectAfter);
+    }
+    return false;
+  }
+
   updatePlayer(dt) {
     const run = this.run;
     const player = run.player;
     const encounter = this.encounter;
-    const weapon = Content.WEAPONS[run.weaponId];
+    let weapon = Content.WEAPONS[run.weaponId];
     const moveX = (this.input.held("right") ? 1 : 0) - (this.input.held("left") ? 1 : 0);
     const moveY = (this.input.held("down") ? 1 : 0) - (this.input.held("up") ? 1 : 0);
     const move = normalizeVector(moveX, moveY, player.lastMove.x, player.lastMove.y);
@@ -802,6 +899,15 @@ export class ActionRuntime {
     player.dashCooldown = Math.max(0, player.dashCooldown - dt);
     player.deflectCooldown = Math.max(0, player.deflectCooldown - dt);
     player.deflectTime = Math.max(0, player.deflectTime - dt);
+    player.deflectPerfectTime = Math.max(0, (player.deflectPerfectTime || 0) - dt);
+    player.deflectSuccess = Math.max(0, (player.deflectSuccess || 0) - dt);
+    player.recoil = Math.max(0, (player.recoil || 0) - dt * 8);
+    player.hurtTime = Math.max(0, (player.hurtTime || 0) - dt);
+    player.stepTimer = Math.max(0, (player.stepTimer || 0) - dt);
+    if (player.actionQueue) {
+      player.actionQueue.time -= dt;
+      if (player.actionQueue.time <= 0) player.actionQueue = null;
+    }
     player.techniqueCooldown = Math.max(
       0,
       player.techniqueCooldown - dt * (hasTechnique(run, "paid_in_full") && player.drive >= 75 ? 1.3 : 1),
@@ -824,19 +930,26 @@ export class ActionRuntime {
     if (player.driveIdle > 2) player.drive = Math.max(0, player.drive - dt * (run.phase === "ascent" ? 3 : 5));
     this.meta.statistics.peakDrive = Math.max(this.meta.statistics.peakDrive || 0, Math.round(player.drive));
 
-    if (this.input.consume("deflect") && player.deflectCooldown <= 0) {
+    let utilityCommitted = false;
+    if (player.deflectCooldown <= 0 && this.canCancelPlayerAction("deflect") && this.input.consume("deflect")) {
       const bonus = [0, 0.012, 0.024][metaRank(this.meta, "reflex_coil")] || 0;
-      player.deflectTime = 0.105 + bonus;
-      player.deflectCooldown = 0.24;
+      player.deflectTime = 0.13 + bonus;
+      player.deflectPerfectTime = 0.07 + bonus;
+      player.deflectCooldown = 0.30;
       player.action = null;
-      audioCall("deflect", { x: player.x, y: player.y });
+      player.actionQueue = null;
+      this.input.consume("dodge");
+      utilityCommitted = true;
+      this.encounter.effects.push({ type: "deflect_arc", x: player.x, y: player.y, angle: player.aim, r: 11, time: 0.13, maxTime: 0.13, color: COLORS.deflect });
+      audioCall("parry", { x: player.x, volume: 0.55 });
     }
 
     if (this.input.consume("interact")) this.interactWithRoom();
 
     const tier = burdenTier(run.phase === "ascent" ? run.carriedWeight + player.lienWeight : 0, burdenCapacity(this.meta));
     const dashMeta = [1, 0.94, 0.88][metaRank(this.meta, "dash_bearings")] || 0.88;
-    if (this.input.consume("dodge") && player.dashCooldown <= 0) {
+    if (!utilityCommitted && player.deflectTime <= 0 && player.dashCooldown <= 0
+      && this.canCancelPlayerAction("dodge") && this.input.consume("dodge")) {
       const direction = move.length > 0 ? move : vecFromAngle(player.aim);
       player.dashDir = { x: direction.x, y: direction.y };
       player.dashSerial += 1;
@@ -846,13 +959,19 @@ export class ActionRuntime {
       player.dashCooldown = tier.dashCooldown * dashMeta * cargoDashCooldown;
       player.invuln = tier.dashIFrames;
       player.action = null;
+      player.actionQueue = null;
+      this.input.consume("deflect");
+      player.dashGhostTimer = 0;
       player.reload = Math.max(0, player.reload);
       this.onDash(tier);
-      audioCall("dash", { tier: tier.id });
+      audioCall("dash", { tier: tier.id, x: player.x, heavy: tier.id === "crushing" });
     }
 
-    if (this.input.consume("swap")) this.cycleWeapon();
-    if (this.input.consume("reload")) this.beginReload();
+    if (!player.action && this.input.consume("swap")) {
+      this.cycleWeapon();
+      weapon = Content.WEAPONS[run.weaponId];
+    }
+    if (!player.action && this.input.consume("reload")) this.beginReload();
 
     if (hasTechnique(run, "quench_capsule") && player.relicCooldown <= 0) {
       const nearbyBullets = encounter.projectiles.filter((projectile) => projectile.faction === "enemy" && distSq(projectile, player) <= 30 ** 2);
@@ -868,6 +987,7 @@ export class ActionRuntime {
     if (player.reload > 0) {
       player.reload -= dt;
       if (player.reload <= 0) {
+        player.reload = 0;
         player.ammo = weapon.resource?.capacity ?? Infinity;
         audioCall("reload", { stage: "complete" });
       }
@@ -878,18 +998,54 @@ export class ActionRuntime {
       const speed = PLAYER_DASH_SPEED * (tier.id === "crushing" ? 0.93 : 1);
       this.movePlayer(player.dashDir.x * speed * dt, player.dashDir.y * speed * dt);
       if (tier.id === "crushing") this.resolveCrushingDash();
+      player.dashGhostTimer = Math.max(0, (player.dashGhostTimer || 0) - dt);
+      if (player.dashGhostTimer <= 0) {
+        player.dashGhostTimer = 0.035;
+        this.encounter.effects.push({
+          type: "player_afterimage", x: player.x, y: player.y, angle: player.aim,
+          time: 0.13, maxTime: 0.13, color: weapon.color,
+        });
+      }
       this.spawnParticle(player.x, player.y, this.encounter.biome.accent, 0.16, -player.dashDir.x * 15, -player.dashDir.y * 15, 2);
       return;
     }
 
+    if (player.action && !player.actionQueue) {
+      if (player.techniqueCooldown <= 0 && this.input.buffered?.("secondary")) {
+        this.input.consume("secondary");
+        this.queuePlayerAction("technique", 0.18);
+      } else if (this.input.buffered?.("primary")) {
+        this.input.consume("primary");
+        this.queuePlayerAction("primary", weapon.resource?.queueWindow || weapon.primary?.buffer || 0.16);
+      }
+    }
     if (player.action) this.updatePlayerAction(dt);
-    const canAct = !player.action && player.reload <= 0 && player.deflectTime <= 0;
-    if (canAct && (this.input.consume("secondary") || this.input.held("secondary"))) this.beginPlayerAction("technique");
-    if (canAct && (this.input.consume("primary") || this.input.held("primary"))) this.beginPlayerAction("primary");
+    let canAct = !player.action && player.reload <= 0 && player.deflectTime <= 0 && player.hurtTime <= 0;
+    if (canAct && player.actionQueue) {
+      const queued = player.actionQueue;
+      if (queued.weaponId !== run.weaponId) player.actionQueue = null;
+      else if (this.beginPlayerAction(queued.type)) player.actionQueue = null;
+      canAct = !player.action && player.reload <= 0 && player.deflectTime <= 0;
+    }
+    // One committed intent per frame. Technique wins ties, but primary remains
+    // buffered instead of overwriting an action that just spent its cooldown.
+    if (canAct && player.techniqueCooldown <= 0 && (this.input.consume("secondary") || this.input.held("secondary"))) {
+      this.beginPlayerAction("technique");
+    }
+    if (!player.action && canAct && (this.input.consume("primary") || this.input.held("primary"))) {
+      this.beginPlayerAction("primary");
+    }
 
     let actionMoveScale = 1;
-    if (player.action) actionMoveScale = player.action.type === "technique" ? 0.72 : 0.86;
-    if (player.reload > 0) actionMoveScale *= 0.88;
+    if (player.action) {
+      const primaryScales = { chainblade: 0.96, repeater: 1, maul: 0.80, prism: 0.93 };
+      const techniqueScales = { chainblade: 0.86, repeater: 0.90, maul: 0.68, prism: 0.88 };
+      actionMoveScale = player.action.type === "technique"
+        ? techniqueScales[run.weaponId] || 0.84
+        : primaryScales[run.weaponId] || 0.92;
+    }
+    if (player.reload > 0) actionMoveScale *= 0.94;
+    if (player.hurtTime > 0) actionMoveScale *= 0.55;
     const driveSpeed = 1 + player.drive / 100 * 0.055;
     const statusSpeed = player.status.tethered ? 0.78 : player.status.slowed ? 0.68 : 1;
     const desiredSpeed = PLAYER_SPEED * tier.speed * (weapon.moveScale || 1) * actionMoveScale * driveSpeed * statusSpeed;
@@ -902,6 +1058,10 @@ export class ActionRuntime {
       player.vy = lerp(player.vy, 0, brake);
     }
     this.movePlayer(player.vx * dt, player.vy * dt);
+    if (move.length > 0 && Math.hypot(player.vx, player.vy) > 34 && player.stepTimer <= 0) {
+      player.stepTimer = tier.id === "crushing" ? 0.22 : 0.17;
+      audioCall("step", { x: player.x, heavy: tier.id === "crushing", volume: 0.55 });
+    }
   }
 
   movePlayer(dx, dy) {
@@ -911,7 +1071,7 @@ export class ActionRuntime {
       dx,
       dy,
       this.collisionObstacles(),
-      this.encounter.bounds,
+      playerViewportBounds(this.encounter.bounds),
     );
     player.x = result.x;
     player.y = result.y;
@@ -1055,7 +1215,13 @@ export class ActionRuntime {
         this.releaseAttackToken(boss);
       }
       const heat = this.encounter.hazards.find((entry) => entry.type === "rotating_safe_grates");
-      if (heat) heat.timer = 0;
+      if (heat) {
+        heat.timer = 0;
+        heat.hitTimer = 0;
+        heat.safeIndex = 0;
+        heat.tellActive = true;
+        heat.active = false;
+      }
       this.clearHostileBullets(rectCenter(hazard.rect), 42, false);
       this.ui.toast?.("QUENCH RELEASE · THE KING STAGGERS");
       audioCall("steam", { boss: true });
@@ -1070,14 +1236,14 @@ export class ActionRuntime {
       if (!Number.isFinite(obstacle.hp)) continue;
       const center = rectCenter(obstacle);
       const radius = Math.hypot(obstacle.w, obstacle.h) * 0.5;
-      if (pointInCone(player, action.angle, range, arc, { ...center, r: radius })) this.damageRoomObstacle(obstacle, damage, "melee");
+      if (pointInCone(player, action.angle, range, arc, center, radius)) this.damageRoomObstacle(obstacle, damage, "melee");
     }
     for (const hazard of this.encounter.hazards) {
       if (!hazard.alive && hazard.type === "interactive_spore_pod") continue;
       const center = hazard.center || (hazard.rect ? rectCenter(hazard.rect) : null);
       if (!center || !["interactive_spore_pod", "boss_quench_valve"].includes(hazard.type)) continue;
       const radius = hazard.radius || (hazard.rect ? Math.hypot(hazard.rect.w, hazard.rect.h) * 0.5 : 4);
-      if (pointInCone(player, action.angle, range, arc, { ...center, r: radius })) this.hitRoomHazard(hazard, "melee");
+      if (pointInCone(player, action.angle, range, arc, center, radius)) this.hitRoomHazard(hazard, "melee");
     }
   }
 
@@ -1085,6 +1251,7 @@ export class ActionRuntime {
     const unlocked = (this.meta.unlockedWeapons || ["chainblade"]).filter((id) => Content.WEAPONS[id]);
     if (unlocked.length < 2) return;
     const player = this.run.player;
+    if (player.action) return;
     const current = Math.max(0, unlocked.indexOf(this.run.weaponId));
     this.run.weaponState[this.run.weaponId] = {
       ammo: player.ammo,
@@ -1100,10 +1267,14 @@ export class ActionRuntime {
       impactCharge: 0,
     };
     this.run.weaponState[this.run.weaponId] = saved;
-    player.ammo = saved.ammo;
-    player.reload = saved.reload;
-    player.impactCharge = saved.impactCharge;
+    const savedAmmo = Number(saved.ammo);
+    player.ammo = weapon.resource?.type === "magazine"
+      ? clamp(Number.isFinite(savedAmmo) ? savedAmmo : weapon.resource.capacity, 0, weapon.resource.capacity)
+      : (saved.ammo ?? Infinity);
+    player.reload = Math.max(0, Number(saved.reload) || 0);
+    player.impactCharge = Math.max(0, Number(saved.impactCharge) || 0);
     player.action = null;
+    player.actionQueue = null;
     this.bot.weaponsUsed.add(this.run.weaponId);
     audioCall("weaponSwap", { weapon: this.run.weaponId });
     this.ui.toast?.(`${weapon.name} readied`);
@@ -1112,7 +1283,7 @@ export class ActionRuntime {
   beginReload() {
     const player = this.run.player;
     const weapon = Content.WEAPONS[this.run.weaponId];
-    if (weapon.resource?.type !== "magazine" || player.reload > 0 || player.ammo >= weapon.resource.capacity) return;
+    if (player.action || weapon.resource?.type !== "magazine" || player.reload > 0 || player.ammo >= weapon.resource.capacity) return;
     player.reload = weapon.resource.reload || 0.9;
     player.action = null;
     audioCall("reload", { stage: "start" });
@@ -1123,12 +1294,12 @@ export class ActionRuntime {
     const player = run.player;
     const weapon = Content.WEAPONS[run.weaponId];
     const part = type === "technique" ? weapon.technique : weapon.primary;
-    if (!part) return;
-    if (type === "technique" && player.techniqueCooldown > 0) return;
+    if (!part) return false;
+    if (type === "technique" && player.techniqueCooldown > 0) return false;
     if (type === "primary" && weapon.resource?.type === "magazine" && player.ammo <= 0) {
       audioCall("empty");
       this.beginReload();
-      return;
+      return false;
     }
 
     let step = null;
@@ -1167,6 +1338,9 @@ export class ActionRuntime {
       resolved: false,
       hitIds: new Set(),
       angle: player.aim,
+      startedAt: this.time,
+      totalDuration: (startup + active + recovery) * speedScale,
+      hitConfirmed: false,
       charge: type === "technique" && weapon.resource?.type === "impact_charge" ? player.impactCharge || 0 : 0,
     };
     if (type === "primary" && weapon.resource?.type === "magazine") player.ammo -= 1;
@@ -1184,7 +1358,9 @@ export class ActionRuntime {
     }
     this.trackAlternating(type);
     this.metrics.attacksStarted += 1;
-    audioCall(type === "technique" ? "attack" : (weapon.kind.includes("ranged") ? "shoot" : "melee"), { weapon: run.weaponId });
+    player.driveIdle = 0;
+    player.invuln = Math.min(player.invuln, 0.12);
+    return true;
   }
 
   trackAlternating(type) {
@@ -1201,20 +1377,26 @@ export class ActionRuntime {
   updatePlayerAction(dt) {
     const action = this.run.player.action;
     if (!action) return;
-    action.time -= dt;
-    if (action.time > 0) return;
     if (action.phase === "startup") {
-      action.phase = "active";
-      action.time = action.active;
-      this.resolvePlayerAction(action);
-      return;
+      const tracking = this.run.weaponId === "maul" ? 8 : 18;
+      action.angle += clamp(angleDiff(this.run.player.aim, action.angle), -tracking * dt, tracking * dt);
     }
-    if (action.phase === "active") {
-      action.phase = "recovery";
-      action.time = action.recovery;
-      return;
+    action.time -= dt;
+    let guard = 0;
+    while (this.run.player.action === action && action.time <= 0 && guard < 4) {
+      guard += 1;
+      const overflow = action.time;
+      if (action.phase === "startup") {
+        action.phase = "active";
+        action.time = action.active + overflow;
+        this.resolvePlayerAction(action);
+      } else if (action.phase === "active") {
+        action.phase = "recovery";
+        action.time = action.recovery + overflow;
+      } else {
+        this.run.player.action = null;
+      }
     }
-    this.run.player.action = null;
   }
 
   resolvePlayerAction(action) {
@@ -1223,6 +1405,16 @@ export class ActionRuntime {
     const weapon = Content.WEAPONS[run.weaponId];
     const pattern = action.part.pattern;
     const damageScale = action.damageScale || 1;
+    const variant = { chainblade: 0, repeater: 1, maul: 2, prism: 3 }[run.weaponId] || 0;
+    const rangedRelease = !pattern.includes("melee") && ["automatic_projectile", "ricochet_projectile", "charged_pin_projectile"].includes(pattern);
+    if (pattern !== "place_shot_splitter") {
+      audioCall(rangedRelease ? "shoot" : "melee", {
+        weapon: run.weaponId,
+        variant,
+        heavy: run.weaponId === "maul" || action.type === "technique",
+        x: player.x,
+      });
+    }
     if (action.type === "primary") {
       if (pattern.includes("melee")) {
         this.playerMelee(action, (action.payload.damage || action.part.damage) * damageScale, (action.payload.poise || action.part.poise) * damageScale, action.payload.range || action.part.range, action.payload.arc || action.part.arc);
@@ -1249,7 +1441,9 @@ export class ActionRuntime {
     } else if (pattern === "place_shot_splitter") {
       const distance = Math.min(action.part.placeRange || 70, dist(player, this.input.pointer));
       const offset = vecFromAngle(action.angle, distance);
-      this.encounter.prisms.push({ uid: `prism:${this.time}`, x: player.x + offset.x, y: player.y + offset.y, r: 4, life: action.part.life || 6, angle: action.angle + Math.PI / 2 });
+      const desired = { x: player.x + offset.x, y: player.y + offset.y };
+      const placed = this.encounter.nav.projectToWalkable(desired, 18) || desired;
+      this.encounter.prisms.push({ uid: `prism:${this.time}`, x: placed.x, y: placed.y, r: 4, life: action.part.life || 6, angle: action.angle + Math.PI / 2 });
       audioCall("ricochet", { kind: "prism-place" });
     } else {
       this.playerMelee(action, (action.part.damage || 28) * damageScale, (action.part.poise || 24) * damageScale, action.part.range || 25, action.part.arc || 80);
@@ -1270,14 +1464,16 @@ export class ActionRuntime {
     if (action.payload.moveStep) this.movePlayer(direction.x, direction.y);
     let hitAny = false;
     for (const enemy of this.encounter.enemies) {
-      if (enemy.dead || action.hitIds.has(enemy.uid)) continue;
+      if (enemy.dead || enemy.state === "enter" || action.hitIds.has(enemy.uid)) continue;
       if (!pointInCone(player, action.angle, range, arc, enemy, enemy.r)) continue;
       action.hitIds.add(enemy.uid);
       hitAny = true;
+      action.hitConfirmed = true;
       this.damageEnemy(enemy, this.modifyPlayerDamage(damage, { ...options, primary: action.type === "primary" }), poise, {
         source: "melee",
         heavy: options.heavy || this.run.weaponId === "maul",
         technique: action.type === "technique",
+        comboStep: action.step,
         angle: action.angle,
       });
     }
@@ -1303,8 +1499,13 @@ export class ActionRuntime {
     }
     if (options.clearBullets) this.clearHostileBullets(player, options.clearBullets, Boolean(options.reflectBullets));
     const end = vecFromAngle(action.angle, range);
-    this.encounter.effects.push({ type: "slash", x: player.x, y: player.y, x2: player.x + end.x, y2: player.y + end.y, angle: action.angle, arc, time: 0.09, color: hitAny ? COLORS.white : Content.WEAPONS[this.run.weaponId].color });
-    if (hitAny) audioCall("hit", { weapon: this.run.weaponId });
+    this.encounter.effects.push({
+      type: "slash", x: player.x, y: player.y, x2: player.x + end.x, y2: player.y + end.y,
+      angle: action.angle, arc, r: range, time: 0.12, maxTime: 0.12,
+      color: hitAny ? COLORS.white : Content.WEAPONS[this.run.weaponId].color,
+      heavy: options.heavy || this.run.weaponId === "maul",
+    });
+    if (hitAny) audioCall("hit", { weapon: this.run.weaponId, x: player.x, heavy: options.heavy || this.run.weaponId === "maul" });
   }
 
   modifyPlayerDamage(base, options = {}) {
@@ -1335,7 +1536,9 @@ export class ActionRuntime {
     const player = this.run.player;
     const range = action.part.range || 80;
     const candidates = this.encounter.enemies
-      .filter((enemy) => !enemy.dead && pointInCone(player, action.angle, range, 20, enemy, enemy.r))
+      .filter((enemy) => !enemy.dead && enemy.state !== "enter"
+        && pointInCone(player, action.angle, range, 20, enemy, enemy.r)
+        && this.encounter.nav.hasLineOfSight(player, enemy, 1.5))
       .sort((a, b) => distSq(player, a) - distSq(player, b));
     const target = candidates[0];
     const end = target || { x: player.x + Math.cos(action.angle) * range, y: player.y + Math.sin(action.angle) * range };
@@ -1379,7 +1582,19 @@ export class ActionRuntime {
         reflectedDamageMultiplier: part.reflectedDamageMultiplier || 1.2,
       });
     }
-    audioCall(this.run.weaponId === "prism" ? "ricochet" : "shoot", { weapon: this.run.weaponId });
+    player.recoil = this.run.weaponId === "prism" ? 1 : 0.65;
+    this.shake = Math.max(this.shake, this.run.weaponId === "prism" ? 0.65 : 0.35);
+    const muzzle = vecFromAngle(baseAngle, 8);
+    this.encounter.effects.push({
+      type: "muzzle", x: player.x + muzzle.x, y: player.y + muzzle.y,
+      angle: baseAngle, time: 0.055, maxTime: 0.055,
+      color: Content.WEAPONS[this.run.weaponId].color,
+    });
+    for (let index = 0; index < 3; index += 1) {
+      const sparkAngle = baseAngle + Math.PI + this.run.rng.range(-0.55, 0.55);
+      const speed = this.run.rng.range(18, 36);
+      this.spawnParticle(player.x + muzzle.x, player.y + muzzle.y, COLORS.white, 0.09, Math.cos(sparkAngle) * speed, Math.sin(sparkAngle) * speed, 1);
+    }
   }
 
   spawnProjectile(projectile) {
@@ -1409,6 +1624,7 @@ export class ActionRuntime {
       reflectedDamageMultiplier: projectile.reflectedDamageMultiplier || 1.5,
       splitBy: projectile.splitBy instanceof Set ? new Set(projectile.splitBy) : new Set(),
       source: projectile.source || null,
+      pullDistance: projectile.pullDistance,
       reflected: Boolean(projectile.reflected),
     });
     this.metrics.projectilesSpawned += 1;
@@ -1445,7 +1661,7 @@ export class ActionRuntime {
   resolveCrushingDash() {
     const player = this.run.player;
     for (const enemy of this.encounter.enemies) {
-      if (enemy.dead || enemy.crushedDashSerial === player.dashSerial) continue;
+      if (enemy.dead || enemy.state === "enter" || enemy.crushedDashSerial === player.dashSerial) continue;
       if (!circlesIntersect({ ...player, r: player.r + 2 }, enemy)) continue;
       enemy.crushedDashSerial = player.dashSerial;
       const cargoDamage = cargoEffects(this.run, "crushing_dash_damage")[0];
@@ -1463,6 +1679,8 @@ export class ActionRuntime {
         continue;
       }
       enemy.flash = Math.max(0, enemy.flash - dt);
+      enemy.hitReaction = Math.max(0, (enemy.hitReaction || 0) - dt);
+      enemy.hitKick = Math.max(0, (enemy.hitKick || 0) - dt * 18);
       enemy.mark = Math.max(0, enemy.mark - dt);
       enemy.armorBroken = Math.max(0, (enemy.armorBroken || 0) - dt);
       enemy.recoveryBuffTime = Math.max(0, (enemy.recoveryBuffTime || 0) - dt);
@@ -1490,7 +1708,11 @@ export class ActionRuntime {
 
       if (enemy.state === "enter") {
         enemy.stateTime -= dt;
-        if (enemy.stateTime <= 0) enemy.state = "move";
+        if (enemy.stateTime <= 0) {
+          enemy.state = "move";
+          enemy.cooldown = Math.max(enemy.cooldown, enemy.boss ? 0.38 : 0.48);
+          this.spawnBurst(enemy.x, enemy.y, enemy.def.color, enemy.boss ? 14 : 5);
+        }
         continue;
       }
       if (enemy.state === "stunned") {
@@ -1580,6 +1802,17 @@ export class ActionRuntime {
       desired = normalizeVector(
         toPlayer.x + -toPlayer.y * enemy.side * blend,
         toPlayer.y + toPlayer.x * enemy.side * blend,
+      );
+    }
+
+    const personalSpace = enemy.r + player.r + (ranged ? 5 : 2.5);
+    if (distance < personalSpace) {
+      const pressure = clamp((personalSpace - distance) / Math.max(1, personalSpace), 0, 1);
+      desired = normalizeVector(
+        desired.x - toPlayer.x * (1.4 + pressure * 2.2) + -toPlayer.y * enemy.side * 0.45,
+        desired.y - toPlayer.y * (1.4 + pressure * 2.2) + toPlayer.x * enemy.side * 0.45,
+        -toPlayer.x,
+        -toPlayer.y,
       );
     }
 
@@ -1685,7 +1918,8 @@ export class ActionRuntime {
     const candidates = attacks.filter((attack) => {
       if (/reinforcement_channel/.test(attack.pattern) && (enemy.reinforcementWaves || 0) >= (attack.maxWaves || Infinity)) return false;
       if (enemy.boss) return true;
-      const range = this.enemyAttackRange(attack);
+      const railPattern = /king_hammer_rail|hammer_line_then_cross/.test(attack.pattern || "");
+      const range = railPattern ? (attack.range || 150) : this.enemyAttackRange(attack);
       if (/blink|empower|link|channel|barrier/.test(attack.pattern)) return true;
       return playerDistance <= range * 1.1;
     });
@@ -1700,6 +1934,9 @@ export class ActionRuntime {
 
   startEnemyAttack(enemy, attack, tokenCost = 1) {
     const timeline = attackTimeline(attack);
+    if (/copy_last_player_action/.test(attack.pattern || "")) {
+      timeline.tell = Math.max(timeline.tell, attack.replayDelay || 0);
+    }
     const player = this.run.player;
     const predict = attack.predict || 0;
     const target = {
@@ -1712,8 +1949,83 @@ export class ActionRuntime {
     enemy.stateTime = timeline.tell;
     enemy.aim = angleBetween(enemy, target);
     enemy.lockedTarget = target;
+    enemy.telegraphTargets = null;
+    enemy.cageGap = null;
+    enemy.cageCenter = null;
+    enemy.stepAnchors = null;
+    enemy.ringGaps = null;
+    enemy.mirrorAims = null;
+    enemy.barrierRects = null;
+    enemy.burrowCenter = null;
+    enemy.copiedWeaponId = null;
+    enemy.sidestepPath = null;
+    enemy.jabOrigin = null;
+    if (/lob_interactive_mine|seed_mortar|crucible_toss/.test(attack.pattern || "")) {
+      enemy.telegraphTargets = Array.from({ length: attack.count || 1 }, (_, index) => index === 0
+        ? { ...target }
+        : {
+            x: target.x + this.run.rng.range(-20, 20),
+            y: target.y + this.run.rng.range(-20, 20),
+          });
+    }
+    if (/prism_cage/.test(attack.pattern || "")) {
+      enemy.cageGap = this.run.rng.int(0, 3);
+      enemy.cageCenter = this.encounter.nav.projectToWalkable(target, 24) || { ...target };
+    }
+    if (/glass_step/.test(attack.pattern || "")) {
+      const anchors = this.encounter.spawnPoints.filter((point) => dist(point, player) > 32);
+      const count = Math.max(1, attack.repeats || 1);
+      const shuffled = this.run.rng.shuffle(anchors.length ? anchors : this.encounter.spawnPoints);
+      enemy.stepAnchors = Array.from({ length: count }, (_, index) => {
+        const point = shuffled[index % shuffled.length];
+        return this.encounter.nav.projectToWalkable(point, 30) || { ...point };
+      });
+    }
+    if (/halo_burst/.test(attack.pattern || "")) {
+      enemy.ringGaps = Array.from({ length: attack.rings || 2 }, () => this.run.rng.int(0, Math.max(0, (attack.countPerRing || 8) - 1)));
+    } else if (/root_burrow_rush/.test(attack.pattern || "")) {
+      enemy.ringGaps = [this.run.rng.int(0, Math.max(0, (attack.ringCount || 11) - 1))];
+      enemy.burrowCenter = this.encounter.nav.projectToWalkable(target, 36) || { ...target };
+    } else if (/hammer_combo_ring/.test(attack.pattern || "")) {
+      enemy.ringGaps = [this.run.rng.int(0, Math.max(0, (attack.finalRingCount || 14) - 1))];
+    }
+    if (/clone_lances/.test(attack.pattern || "")) {
+      enemy.mirrorAims = (enemy.mirrors || []).map((mirror) => angleBetween(mirror, target));
+    }
+    if (/spawn_barrier|barrier_cross/.test(attack.pattern || "")) {
+      const center = this.encounter.nav.projectToWalkable(target, 24) || { ...target };
+      const horizontal = this.run.rng.chance();
+      const barrier = attack.barrier || {};
+      const longSide = barrier.w || 44;
+      const shortSide = barrier.h || 6;
+      const w = horizontal ? longSide : shortSide;
+      const h = horizontal ? shortSide : longSide;
+      enemy.barrierRects = [{ x: center.x - w / 2, y: center.y - h / 2, w, h }];
+    }
+    if (/copy_last_player_action/.test(attack.pattern || "")) {
+      enemy.copiedWeaponId = this.run.weaponId;
+    }
+    if (/sidestep_jab/.test(attack.pattern || "")) {
+      const anchors = [];
+      let cursor = { x: enemy.x, y: enemy.y, r: enemy.r };
+      for (let index = 0; index < (attack.sidesteps || 3); index += 1) {
+        const side = index % 2 === 0 ? enemy.side : -enemy.side;
+        const moved = moveCircleWithSliding(
+          cursor,
+          -Math.sin(enemy.aim) * side * 7,
+          Math.cos(enemy.aim) * side * 7,
+          this.collisionObstacles(),
+          this.encounter.bounds,
+        );
+        cursor = { x: moved.x, y: moved.y, r: enemy.r };
+        anchors.push({ x: moved.x, y: moved.y });
+      }
+      enemy.sidestepPath = anchors;
+      enemy.jabOrigin = anchors.at(-1) || { x: enemy.x, y: enemy.y };
+    }
     enemy.tokenHeld = tokenCost;
     enemy.activeResolved = false;
+    enemy.crossFired = false;
     enemy.shotsFired = 0;
     this.encounter.attackTokensUsed += tokenCost;
     audioCall("enemyTell", { enemy: enemy.id, attack: attack.pattern, urgency: 1 - timeline.tell });
@@ -1728,7 +2040,7 @@ export class ActionRuntime {
   beginEnemyActive(enemy) {
     const pattern = enemy.attack.pattern;
     if (pattern === "root_burrow_rush") {
-      const projected = this.encounter.nav.projectToWalkable(enemy.lockedTarget, 36);
+      const projected = enemy.burrowCenter || enemy.lockedTarget;
       this.spawnBurst(enemy.x, enemy.y, enemy.def.color, 12);
       if (projected) {
         enemy.x = projected.x;
@@ -1737,11 +2049,13 @@ export class ActionRuntime {
       const ringAttack = {
         ...enemy.attack,
         damage: enemy.attack.emergeDamage || enemy.attack.damage || 18,
+        projectileRange: 72,
         safeGaps: Math.max(1, Math.round((enemy.attack.safeGap || 60) / (360 / (enemy.attack.ringCount || 11)))),
+        safeGapIndex: enemy.ringGaps?.[0],
       };
       this.enemyRing(enemy, ringAttack, enemy.attack.ringCount || 11, enemy.attack.ringSpeed || 58);
       if (dist(enemy, this.run.player) < enemy.r + this.run.player.r + 10) {
-        this.damagePlayer(enemy.attack.emergeDamage || 18, { source: enemy, angle: enemy.aim, kind: "burrow" });
+        this.damagePlayer(enemy.attack.emergeDamage || 18, { source: enemy, angle: angleBetween(enemy, this.run.player), kind: "burrow" });
       }
       enemy.activeResolved = true;
       this.spawnBurst(enemy.x, enemy.y, enemy.def.color, 18);
@@ -1749,12 +2063,11 @@ export class ActionRuntime {
     }
     if (/blink|glass_step/.test(pattern)) {
       const anchors = this.encounter.spawnPoints.filter((point) => dist(point, this.run.player) > 32);
-      const point = this.run.rng.pick(anchors) || { x: enemy.x, y: enemy.y };
-      const projected = this.encounter.nav.projectToWalkable(point, 30);
-      if (projected) {
+      const point = enemy.stepAnchors?.[0] || this.run.rng.pick(anchors) || { x: enemy.x, y: enemy.y };
+      if (point) {
         this.spawnBurst(enemy.x, enemy.y, enemy.def.color, 8);
-        enemy.x = projected.x;
-        enemy.y = projected.y;
+        enemy.x = point.x;
+        enemy.y = point.y;
         this.spawnBurst(enemy.x, enemy.y, enemy.def.color, 8);
       }
       enemy.activeResolved = !/glass_step/.test(pattern);
@@ -1765,7 +2078,11 @@ export class ActionRuntime {
       enemy.vy = velocity.y;
     }
     enemy.activeBeat = 0;
-    if (pattern === "steal_then_flee") enemy.vx = Math.cos(enemy.aim) * (enemy.attack.speed || 110);
+    if (pattern === "steal_then_flee") {
+      const velocity = vecFromAngle(enemy.aim, enemy.attack.speed || 110);
+      enemy.vx = velocity.x;
+      enemy.vy = velocity.y;
+    }
   }
 
   updateEnemyActive(enemy, dt) {
@@ -1781,7 +2098,7 @@ export class ActionRuntime {
       if (enemy.shotsFired < repeats && elapsed >= enemy.shotsFired * interval) {
         if (enemy.shotsFired > 0) {
           const anchors = this.encounter.spawnPoints.filter((point) => dist(point, this.run.player) > 28);
-          const point = this.encounter.nav.projectToWalkable(this.run.rng.pick(anchors) || enemy, 30);
+          const point = enemy.stepAnchors?.[enemy.shotsFired] || this.run.rng.pick(anchors) || enemy;
           if (point) {
             this.spawnBurst(enemy.x, enemy.y, enemy.def.color, 7);
             enemy.x = point.x;
@@ -1790,7 +2107,7 @@ export class ActionRuntime {
         }
         for (let index = 0; index < (attack.crossCount || 4); index += 1) {
           const angle = index / (attack.crossCount || 4) * TAU + (enemy.shotsFired % 2 ? Math.PI / 4 : 0);
-          this.enemyAimedShot(enemy, attack, angle, { speed: attack.projectileSpeed || 86 });
+          this.enemyAimedShot(enemy, attack, angle, { speed: attack.projectileSpeed || 86, maxDistance: 76 });
         }
         enemy.shotsFired += 1;
       }
@@ -1800,7 +2117,7 @@ export class ActionRuntime {
     if (pattern === "king_hammer_rail" || pattern === "hammer_line_then_cross") {
       if (!enemy.activeResolved) {
         enemy.activeResolved = true;
-        const length = 150;
+        const length = attack.range || 150;
         const a = { x: enemy.x, y: enemy.y };
         const b = { x: enemy.x + Math.cos(enemy.aim) * length, y: enemy.y + Math.sin(enemy.aim) * length };
         const width = (attack.lineWidth || 14) / 2;
@@ -1808,20 +2125,27 @@ export class ActionRuntime {
           this.damagePlayer(attack.lineDamage || attack.damage || 21, { source: enemy, angle: enemy.aim, kind: "hammer-rail" });
         }
         this.encounter.effects.push({ type: "strike_line", ...a, x2: b.x, y2: b.y, width: attack.lineWidth || 14, time: 0.18, color: enemy.def.color });
-        for (const side of [-1, 1]) {
-          this.enemyAimedShot(enemy, { ...attack, damage: attack.crossDamage || 17 }, enemy.aim + side * Math.PI / 2, { speed: attack.crossSpeed || 80, kind: "hammer_cross" });
-        }
         this.shake = Math.max(this.shake, 3);
+      }
+      if (!enemy.crossFired && elapsed >= (attack.crossDelay || 0.20)) {
+        enemy.crossFired = true;
+        for (const side of [-1, 1]) {
+          this.enemyAimedShot(enemy, { ...attack, damage: attack.crossDamage || 17 }, enemy.aim + side * Math.PI / 2, {
+            speed: attack.crossSpeed || 80,
+            kind: "hammer_cross",
+            maxDistance: attack.crossRange || 105,
+          });
+        }
       }
       return;
     }
 
-    if (/bellows_sweep/.test(pattern)) {
+    if (/bellows_sweep|sweeping_cone/.test(pattern)) {
       const progress = clamp(elapsed / Math.max(0.01, enemy.attackTimeline.active), 0, 1);
-      const sweep = degrees(attack.maxSweep || 90);
+      const sweep = degrees(attack.maxSweep || attack.sweep || 90);
       const sweepAngle = enemy.aim - sweep / 2 + sweep * progress;
       if (!enemy.activeResolved && pointInCone(enemy, sweepAngle, attack.range || 58, attack.arc || 65, this.run.player, this.run.player.r)
-        && this.encounter.nav.hasLineOfSight(enemy, this.run.player)) {
+        && (!attack.blockedByObstacles || this.encounter.nav.hasLineOfSight(enemy, this.run.player))) {
         enemy.activeResolved = true;
         this.damagePlayer(attack.damage || 19, { source: enemy, angle: sweepAngle, kind: "bellows" });
       }
@@ -1833,21 +2157,15 @@ export class ActionRuntime {
       const steps = attack.sidesteps || 3;
       const interval = attack.sidestepTime || 0.12;
       if (enemy.activeBeat < steps && elapsed >= enemy.activeBeat * interval) {
-        const side = enemy.activeBeat % 2 === 0 ? enemy.side : -enemy.side;
-        const moved = moveCircleWithSliding(
-          enemy,
-          -Math.sin(enemy.aim) * side * 7,
-          Math.cos(enemy.aim) * side * 7,
-          this.collisionObstacles(),
-          this.encounter.bounds,
-        );
-        enemy.x = moved.x;
-        enemy.y = moved.y;
+        const anchor = enemy.sidestepPath?.[enemy.activeBeat];
+        if (anchor) {
+          enemy.x = anchor.x;
+          enemy.y = anchor.y;
+        }
         enemy.activeBeat += 1;
       }
       if (enemy.activeBeat >= steps && !enemy.activeResolved && elapsed >= steps * interval) {
         enemy.activeResolved = true;
-        enemy.aim = angleBetween(enemy, this.run.player);
         if (pointInCone(enemy, enemy.aim, attack.range || 15, 70, this.run.player, this.run.player.r)) {
           this.damagePlayer(attack.damage || 7, { source: enemy, angle: enemy.aim, kind: "jab" });
         }
@@ -1860,7 +2178,6 @@ export class ActionRuntime {
       if (/pounce_pair/.test(pattern) && enemy.activeBeat === 0 && elapsed >= (attack.repeatDelay || 0.16)) {
         enemy.activeBeat = 1;
         enemy.activeResolved = false;
-        enemy.aim = angleBetween(enemy, this.run.player);
         const velocity = vecFromAngle(enemy.aim, attack.speed || 112);
         enemy.vx = velocity.x;
         enemy.vy = velocity.y;
@@ -1869,7 +2186,6 @@ export class ActionRuntime {
         const beat = Math.min(attack.advanceBeats || 3, Math.floor(elapsed / 0.09) + 1);
         if (beat > enemy.activeBeat) {
           enemy.activeBeat = beat;
-          enemy.aim = angleBetween(enemy, this.run.player);
           const velocity = vecFromAngle(enemy.aim, enemy.def.speed * (1.7 + beat * 0.18));
           enemy.vx = velocity.x;
           enemy.vy = velocity.y;
@@ -1893,8 +2209,8 @@ export class ActionRuntime {
       }
       if (!enemy.activeResolved && circlesIntersect(enemy, this.run.player, 1)) {
         enemy.activeResolved = true;
-        this.damagePlayer(attack.damage || 12, { source: enemy, angle: enemy.aim, kind: "melee" });
-        if (pattern === "steal_then_flee" && this.run.cargo.length) {
+        const landed = this.damagePlayer(attack.damage || 12, { source: enemy, angle: enemy.aim, kind: "melee" });
+        if (landed && pattern === "steal_then_flee" && this.run.cargo.length) {
           const stolen = [...this.run.cargo].sort((a, b) => b.weight - a.weight)[0];
           stolen.sealed = true;
           this.ui.toast?.(`${stolen.name} sealed — kill the Confiscator!`);
@@ -1903,7 +2219,7 @@ export class ActionRuntime {
       return;
     }
 
-    if (/melee_arc|sidestep_jab|sweeping_cone|shield_bash|hammer_line|hook_pull_slam|bellows_sweep/.test(pattern)) {
+    if (/melee_arc|sidestep_jab|sweeping_cone|shield_bash|hammer_line|bellows_sweep/.test(pattern)) {
       if (!enemy.activeResolved) {
         enemy.activeResolved = true;
         const range = attack.range || (enemy.boss ? 38 : 18);
@@ -1917,7 +2233,7 @@ export class ActionRuntime {
     }
 
     if (/empower|haste_link/.test(pattern)) {
-      if (!enemy.activeResolved) {
+      if (!enemy.activeResolved && elapsed >= enemy.attackTimeline.active * 0.72) {
         enemy.activeResolved = true;
         const ally = this.encounter.enemies.filter((entry) => entry !== enemy && !entry.dead).sort((a, b) => distSq(enemy, a) - distSq(enemy, b))[0];
         if (ally) {
@@ -1933,9 +2249,9 @@ export class ActionRuntime {
     if (/spawn_barrier|barrier_cross|prism_cage/.test(pattern)) {
       if (!enemy.activeResolved) {
         enemy.activeResolved = true;
-        const center = this.run.player;
         if (/prism_cage/.test(pattern)) {
-          const gap = this.run.rng.int(0, 3);
+          const center = enemy.cageCenter || enemy.lockedTarget;
+          const gap = Number.isInteger(enemy.cageGap) ? enemy.cageGap : this.run.rng.int(0, 3);
           const walls = [
             { x: center.x - 24, y: center.y - 20, w: 48, h: 4 },
             { x: center.x - 24, y: center.y + 16, w: 48, h: 4 },
@@ -1948,14 +2264,17 @@ export class ActionRuntime {
           });
           this.ui.toast?.("PRISM CAGE · THE FLICKERING SIDE IS OPEN");
         } else {
-          const horizontal = this.run.rng.chance();
-          this.encounter.barriers.push({
-            x: center.x - (horizontal ? 22 : 3), y: center.y - (horizontal ? 3 : 22),
-            w: horizontal ? 44 : 6, h: horizontal ? 6 : 44,
-            id: `barrier:${this.time}`,
-            life: attack.barrier?.life || attack.barrierLife || 5, hp: attack.barrier?.hp || attack.barrierHp || 45,
-            solid: true, reflect: false, color: enemy.def.color,
-          });
+          const walls = enemy.barrierRects || [];
+          walls.forEach((wall, index) => this.encounter.barriers.push({
+            ...wall,
+            id: `barrier:${this.time}:${index}`,
+            life: attack.barrier?.life || attack.barrierLife || 5,
+            hp: attack.barrier?.hp || attack.barrierHp || 45,
+            slow: attack.barrier?.slow || 0,
+            solid: true,
+            reflect: false,
+            color: enemy.def.color,
+          }));
         }
         this.rebuildNavigation();
       }
@@ -1966,7 +2285,10 @@ export class ActionRuntime {
       if (!enemy.activeResolved && elapsed > Math.min(0.7, enemy.attackTimeline.active * 0.75)) {
         enemy.activeResolved = true;
         enemy.reinforcementWaves = (enemy.reinforcementWaves || 0) + 1;
-        this.spawnBudgetEnemies(attack.reinforcementBudget || 2, enemyPoolFor(this.run.roomIndex, this.run.phase).filter((entry) => !entry.elite));
+        const reinforcementPool = enemyPoolFor(this.run.roomIndex, this.run.phase)
+          .filter((entry) => entry.id !== enemy.id && !entry.elite
+            && !(entry.attacks || []).some((candidate) => /reinforcement_channel/.test(candidate.pattern || "")));
+        this.spawnBudgetEnemies(attack.reinforcementBudget || 2, reinforcementPool);
       }
       return;
     }
@@ -1974,11 +2296,18 @@ export class ActionRuntime {
     if (/temporary_weight_beam/.test(pattern)) {
       if (!enemy.activeResolved) {
         enemy.activeResolved = true;
-        if (dist(enemy, this.run.player) < (attack.range || 78) && this.encounter.nav.hasLineOfSight(enemy, this.run.player)) {
-          this.damagePlayer(attack.damage || 6, { source: enemy, angle: enemy.aim, kind: "beam" });
-          this.run.player.lienWeight = Math.max(this.run.player.lienWeight, attack.lienWeight || 12);
-          this.encounter.effects.push({ type: "beam", x: enemy.x, y: enemy.y, x2: this.run.player.x, y2: this.run.player.y, time: 0.18, color: "#f0d783" });
+        const beamRange = attack.range || 78;
+        const beamEnd = {
+          x: enemy.x + Math.cos(enemy.aim) * beamRange,
+          y: enemy.y + Math.sin(enemy.aim) * beamRange,
+        };
+        const inBeam = distancePointSegment(this.run.player, enemy, beamEnd).distance
+          <= this.run.player.r + (attack.lineWidth || 5) / 2;
+        if (inBeam && this.encounter.nav.hasLineOfSight(enemy, this.run.player)) {
+          const landed = this.damagePlayer(attack.damage || 6, { source: enemy, angle: enemy.aim, kind: "beam" });
+          if (landed) this.run.player.lienWeight = Math.max(this.run.player.lienWeight, attack.lienWeight || 12);
         }
+        this.encounter.effects.push({ type: "beam", x: enemy.x, y: enemy.y, x2: beamEnd.x, y2: beamEnd.y, time: 0.18, color: "#f0d783" });
       }
       return;
     }
@@ -1986,7 +2315,12 @@ export class ActionRuntime {
     if (/tether_anchor|hook_pull/.test(pattern)) {
       if (!enemy.activeResolved) {
         enemy.activeResolved = true;
-        this.enemyAimedShot(enemy, attack, enemy.aim, { kind: "tether", speed: attack.projectileSpeed || 95 });
+        this.enemyAimedShot(enemy, attack, enemy.aim, {
+          kind: "tether",
+          speed: attack.projectileSpeed || 95,
+          maxDistance: attack.range || attack.tetherRange || 76,
+          pullDistance: attack.pullDistance || 15,
+        });
       }
       return;
     }
@@ -1994,10 +2328,7 @@ export class ActionRuntime {
     if (/lob_interactive_mine|seed_mortar|crucible_toss/.test(pattern)) {
       const count = attack.count || 1;
       if (enemy.shotsFired < count && elapsed >= enemy.shotsFired * 0.12) {
-        const target = enemy.shotsFired === 0 ? enemy.lockedTarget : {
-          x: this.run.player.x + this.run.rng.range(-20, 20),
-          y: this.run.player.y + this.run.rng.range(-20, 20),
-        };
+        const target = enemy.telegraphTargets?.[enemy.shotsFired] || enemy.lockedTarget;
         this.encounter.effects.push({
           type: "mine", x: target.x, y: target.y, r: attack.blastRadius || 17,
           time: attack.armTime || attack.flight || 0.7, fuse: attack.fuse || 1.2,
@@ -2016,9 +2347,14 @@ export class ActionRuntime {
       const interval = attack.ringDelay || 0.28;
       if (enemy.shotsFired < rings && elapsed >= enemy.shotsFired * interval) {
         const speeds = Array.isArray(attack.projectileSpeed) ? attack.projectileSpeed : [attack.projectileSpeed || 60];
-        const ringAttack = { ...attack, safeGaps: Math.max(1, Math.round((attack.safeGap || 55) / (360 / (attack.countPerRing || 8)))) };
+        const ringAttack = {
+          ...attack,
+          projectileRange: 82,
+          safeGaps: Math.max(1, Math.round((attack.safeGap || 55) / (360 / (attack.countPerRing || 8)))),
+          angleOffset: enemy.aim * 0.15 + degrees(enemy.shotsFired * (attack.offsetSecondRing || 18)),
+        };
+        ringAttack.safeGapIndex = enemy.ringGaps?.[enemy.shotsFired];
         const originalAim = enemy.aim;
-        enemy.aim += enemy.shotsFired * degrees(attack.offsetSecondRing || 18);
         this.enemyRing(enemy, ringAttack, attack.countPerRing || 8, speeds[Math.min(enemy.shotsFired, speeds.length - 1)]);
         enemy.aim = originalAim;
         enemy.shotsFired += 1;
@@ -2032,11 +2368,13 @@ export class ActionRuntime {
       if (enemy.shotsFired < strikes && elapsed >= enemy.shotsFired * interval) {
         const radius = 22 + enemy.shotsFired * 4;
         if (dist(enemy, this.run.player) <= radius + this.run.player.r) {
-          this.damagePlayer(attack.damage || 22, { source: enemy, angle: enemy.aim, kind: "hammer-combo" });
+          this.damagePlayer(attack.damage || 22, { source: enemy, angle: angleBetween(enemy, this.run.player), kind: "hammer-combo" });
         }
         this.encounter.effects.push({ type: "impact_ring", x: enemy.x, y: enemy.y, r: radius, time: 0.15, color: enemy.def.color });
         enemy.shotsFired += 1;
-        if (enemy.shotsFired === strikes) this.enemyRing(enemy, attack, attack.finalRingCount || 14, attack.finalRingSpeed || 83);
+        if (enemy.shotsFired === strikes) {
+          this.enemyRing(enemy, { ...attack, projectileRange: 78, safeGapIndex: enemy.ringGaps?.[0] }, attack.finalRingCount || 14, attack.finalRingSpeed || 83);
+        }
       }
       return;
     }
@@ -2071,14 +2409,15 @@ export class ActionRuntime {
     }
 
     if (/aimed_burst|predictive_pair|clone_lances|mirrored_ricochet_pair/.test(pattern)) {
-      const count = attack.count || (pattern.includes("pair") ? 2 : 4);
+      const count = attack.count || attack.lanes || (pattern.includes("pair") ? 2 : 4);
       const interval = attack.interval || 0.11;
       if (enemy.shotsFired < count && elapsed >= enemy.shotsFired * interval) {
         const angle = enemy.aim + (enemy.shotsFired - (count - 1) / 2) * degrees(attack.spread || 3);
         this.enemyAimedShot(enemy, attack, angle, { bounces: pattern.includes("ricochet") ? (attack.reflections || 1) : 0 });
         if (/clone_lances/.test(pattern)) {
-          for (const mirror of (enemy.mirrors || []).filter((entry) => entry.disabled <= 0)) {
-            this.enemyAimedShot(enemy, attack, angleBetween(mirror, this.run.player), { origin: mirror, bounces: attack.reflections || 1 });
+          for (const [mirrorIndex, mirror] of (enemy.mirrors || []).entries()) {
+            if (mirror.disabled > 0) continue;
+            this.enemyAimedShot(enemy, attack, enemy.mirrorAims?.[mirrorIndex] ?? angleBetween(mirror, this.run.player), { origin: mirror, bounces: attack.reflections || 1 });
           }
         }
         enemy.shotsFired += 1;
@@ -2089,7 +2428,7 @@ export class ActionRuntime {
     if (/root_wall_wave/.test(pattern)) {
       const waves = attack.waves || 2;
       if (enemy.shotsFired < waves && elapsed >= enemy.shotsFired * (attack.interval || 0.30)) {
-        this.enemyFan(enemy, attack, 5, 12, { speed: attack.speed || attack.projectileSpeed || 63 });
+        this.enemyFan(enemy, attack, 5, 12, { speed: attack.speed || attack.projectileSpeed || 63, maxDistance: 112 });
         enemy.shotsFired += 1;
       }
       return;
@@ -2120,7 +2459,7 @@ export class ActionRuntime {
         this.encounter.effects.push({ type: "slash", x: enemy.x, y: enemy.y, x2: enemy.x + Math.cos(sweepAngle) * 38, y2: enemy.y + Math.sin(sweepAngle) * 38, angle: sweepAngle, arc: attack.arc || 80, time: 0.09, color: enemy.def.color });
         enemy.shotsFired += 1;
         if (enemy.shotsFired === swipes && attack.finalProjectiles) {
-          this.enemyFan(enemy, attack, attack.finalProjectiles, attack.spread || 12, { speed: attack.projectileSpeed || 74 });
+          this.enemyFan(enemy, attack, attack.finalProjectiles, attack.spread || 12, { speed: attack.projectileSpeed || 74, maxDistance: 88 });
         }
       }
       return;
@@ -2129,7 +2468,7 @@ export class ActionRuntime {
     if (/copy_last_player_action/.test(pattern)) {
       if (!enemy.activeResolved) {
         enemy.activeResolved = true;
-        if (["repeater", "prism"].includes(this.run.weaponId)) this.enemyFan(enemy, attack, 3, 7);
+        if (["repeater", "prism"].includes(enemy.copiedWeaponId)) this.enemyFan(enemy, attack, 3, 7);
         else if (pointInCone(enemy, enemy.aim, 28, 110, this.run.player, this.run.player.r)) this.damagePlayer(attack.damage || 13, { source: enemy, angle: enemy.aim, kind: "melee" });
       }
       return;
@@ -2146,20 +2485,23 @@ export class ActionRuntime {
     const speed = (options.speed || attack.projectileSpeed || 88) * speedMultiplier;
     const velocity = vecFromAngle(angle, speed);
     const origin = options.origin || enemy;
+    const travelDistance = options.maxDistance ?? attack.projectileRange ?? this.enemyAttackRange(attack);
+    const muzzleDistance = (origin.r || enemy.r) + 2;
     this.spawnProjectile({
-      x: origin.x + Math.cos(angle) * ((origin.r || enemy.r) + 2),
-      y: origin.y + Math.sin(angle) * ((origin.r || enemy.r) + 2),
+      x: origin.x + Math.cos(angle) * muzzleDistance,
+      y: origin.y + Math.sin(angle) * muzzleDistance,
       vx: velocity.x,
       vy: velocity.y,
       r: attack.projectileRadius || 1.6,
       damage: attack.damage || 10,
       faction: "enemy",
       color: enemy.def.color || this.encounter.biome.projectile,
-      life: 3.2,
+      life: Math.max(0.02, (travelDistance - muzzleDistance) / speed),
       bounces: options.bounces || 0,
       kind: options.kind || attack.pattern,
       homing: options.homing || 0,
       source: enemy,
+      pullDistance: options.pullDistance,
     });
   }
 
@@ -2171,11 +2513,13 @@ export class ActionRuntime {
   }
 
   enemyRing(enemy, attack, count, speed) {
-    const gap = this.run.rng.int(0, Math.max(0, count - 1));
+    const gap = Number.isInteger(attack.safeGapIndex)
+      ? attack.safeGapIndex % Math.max(1, count)
+      : this.run.rng.int(0, Math.max(0, count - 1));
     const safeGaps = attack.safeGaps || 0;
     for (let index = 0; index < count; index += 1) {
       if (safeGaps && Math.min((index - gap + count) % count, (gap - index + count) % count) < safeGaps) continue;
-      const angle = index / count * TAU + enemy.aim * 0.15;
+      const angle = index / count * TAU + (Number.isFinite(attack.angleOffset) ? attack.angleOffset : enemy.aim * 0.15);
       this.enemyAimedShot(enemy, { ...attack, projectileSpeed: speed }, angle);
     }
   }
@@ -2211,6 +2555,16 @@ export class ActionRuntime {
     enemy.sequenceQueue = [];
     enemy.phaseTriggers = new Set();
     enemy.exposed = 0;
+    if (enemy.id === "furnace_king" && enemy.phase >= 2) {
+      const heat = this.encounter.hazards.find((hazard) => hazard.type === "rotating_safe_grates");
+      if (heat) {
+        heat.timer = 0;
+        heat.hitTimer = 0;
+        heat.safeIndex = 0;
+        heat.tellActive = true;
+        heat.active = false;
+      }
+    }
     const enter = phase.enter;
     if (!enter) return;
 
@@ -2350,29 +2704,49 @@ export class ActionRuntime {
         this.ui.toast?.("SAINT FRACTURED · REFLECTION ANSWERED");
       }
     }
-    enemy.flash = 0.08;
-    const knock = vecFromAngle(context.angle || angleBetween(this.run.player, enemy), context.heavy ? 5 : 2);
+    const impactAngle = context.angle ?? angleBetween(this.run.player, enemy);
+    enemy.flash = context.heavy ? 0.11 : 0.085;
+    enemy.hitReaction = context.heavy ? 0.13 : 0.09;
+    enemy.hitAngle = impactAngle;
+    enemy.hitKick = context.heavy ? 2.8 : context.source === "projectile" ? 1.2 : 1.8;
+    const knockDistance = context.heavy ? 8 : context.source === "projectile" ? 2.5 : 4;
+    const knock = vecFromAngle(impactAngle, knockDistance);
     if (!enemy.boss) {
       const moved = moveCircleWithSliding(enemy, knock.x, knock.y, this.collisionObstacles(), this.encounter.bounds);
       enemy.x = moved.x;
       enemy.y = moved.y;
     }
     this.onPlayerHitEnemy(enemy, damage, context);
-    this.spawnBurst(enemy.x, enemy.y, context.source === "projectile" ? "#f4db9d" : COLORS.white, context.heavy ? 8 : 4);
-    this.hitstop = Math.max(this.hitstop, context.heavy ? 0.052 : 0.025);
-    this.shake = Math.max(this.shake, context.heavy ? 2.2 : 0.7);
+    this.spawnImpact(enemy.x, enemy.y, impactAngle, context.source === "projectile" ? "#f4db9d" : COLORS.white, context.heavy ? 10 : 6, Boolean(context.heavy));
+    const hitstopFrames = context.heavy ? 4 : context.comboStep === 2 ? 3 : context.source === "projectile" ? 1 : 2;
+    this.addHitstop(hitstopFrames, context.heavy ? 0.15 : 0.055);
+    this.shake = Math.max(this.shake, context.heavy ? 2.6 : context.source === "projectile" ? 0.45 : 0.9);
+    audioCall(hitsArmor && damage <= 1 ? "block" : "enemyHit", {
+      x: enemy.x,
+      heavy: Boolean(context.heavy),
+      variant: { chainblade: 0, repeater: 1, maul: 2, prism: 3 }[this.run.weaponId] || 0,
+    });
 
     if (enemy.hp <= 0) {
+      this.addHitstop(enemy.boss || enemy.elite ? 5 : hitstopFrames + 1, enemy.boss ? 0.32 : 0.18);
       this.killEnemy(enemy, context);
       return true;
     }
     if (enemy.poise <= 0) {
+      const interruptedPattern = enemy.attack?.pattern || "";
+      const interruptPause = /reinforcement_channel|interruptible_empower/.test(interruptedPattern)
+        ? (enemy.attack?.interruptPause || 1.4)
+        : 0;
       this.releaseAttackToken(enemy);
       enemy.state = "stunned";
-      enemy.stateTime = Math.max(enemy.stateTime || 0, enemy.boss ? 0.65 : 0.85);
+      enemy.stateTime = Math.max(enemy.stateTime || 0, interruptPause || (enemy.boss ? 0.65 : 0.85));
       enemy.poise = enemy.maxPoise;
       enemy.armorBroken = Math.max(enemy.armorBroken || 0, enemy.def.armor ? 2 : 0);
-      audioCall("stagger", { enemy: enemy.id });
+      this.addHitstop(enemy.boss || enemy.elite ? 5 : 4, 0.22);
+      this.shake = Math.max(this.shake, enemy.boss ? 3.2 : 2.2);
+      this.encounter.effects.push({ type: "impact_ring", x: enemy.x, y: enemy.y, r: enemy.r + 8, time: 0.18, maxTime: 0.18, color: COLORS.gold });
+      audioCall("stagger", { enemy: enemy.id, x: enemy.x, heavy: true });
+      if (interruptPause) this.ui.toast?.(`${enemy.def.name} CHANNEL BROKEN`);
       this.addDrive(7);
     }
     return true;
@@ -2441,7 +2815,13 @@ export class ActionRuntime {
     this.encounter.roomKills += 1;
     this.addDrive(enemy.boss ? 30 : enemy.elite ? 18 : 11);
     this.spawnBurst(enemy.x, enemy.y, enemy.def.color, enemy.boss ? 42 : enemy.elite ? 16 : 9);
-    audioCall(enemy.boss ? "explosion" : "enemyHit", { killed: true, enemy: enemy.id });
+    this.encounter.effects.push({
+      type: "impact_ring", x: enemy.x, y: enemy.y,
+      r: enemy.boss ? enemy.r + 18 : enemy.r + (enemy.elite ? 11 : 7),
+      time: enemy.boss ? 0.36 : 0.20, maxTime: enemy.boss ? 0.36 : 0.20,
+      color: enemy.def.color,
+    });
+    audioCall(enemy.boss ? "explosion" : "execute", { killed: true, enemy: enemy.id, x: enemy.x, heavy: enemy.elite });
 
     if (this.run.phase === "descent" && !enemy.boss) {
       const value = Math.round(rangeFrom(this.run.rng, enemy.def.loot?.value, 10));
@@ -2459,7 +2839,8 @@ export class ActionRuntime {
       this.encounter.effects.push({ type: "mine", x: enemy.x, y: enemy.y, r: 14, time: 0.55, fuse: 8, damage: 24, faction: "player", color: "#86d985", armed: false });
     }
     const deathPattern = enemy.def.deathPattern;
-    if (!enemy.noSplit && deathPattern?.pattern === "split_unless_crushed" && !["melee", "reflected", "dash"].includes(context.source)) {
+    if (!enemy.noSplit && deathPattern?.pattern === "split_unless_crushed"
+      && !context.reflected && !["melee", "reflected", "dash"].includes(context.source)) {
       for (let index = 0; index < (deathPattern.count || 2); index += 1) {
         const child = this.spawnEnemy(enemy.id, {
           x: enemy.x + (index ? 5 : -5),
@@ -2489,31 +2870,51 @@ export class ActionRuntime {
     audioCall("roomClear", { boss: true });
   }
 
+  applyPlayerKnockback(context = {}, distance = 8) {
+    const player = this.run.player;
+    const angle = Number.isFinite(context.angle)
+      ? context.angle
+      : context.source
+        ? angleBetween(context.source, player)
+        : player.aim + Math.PI;
+    const knock = vecFromAngle(angle, distance);
+    this.movePlayer(knock.x, knock.y);
+  }
+
   damagePlayer(amount, context = {}) {
     const player = this.run.player;
+    // The killing blow is the end of the exchange. Hostile projectiles and room
+    // hazards may still animate during the clear beat, but they cannot steal the
+    // victory after the boss has already fallen.
+    const finalWaveDefeated = this.encounter?.enemies?.length > 0
+      && !this.encounter.waves?.[this.encounter.waveIndex + 1]
+      && this.encounter.enemies.every((enemy) => enemy.dead);
+    if (this.encounter?.clear || this.encounter?.boss?.dead || finalWaveDefeated) return false;
     if (this.bot.god) return false;
-    if (player.deflectTime > 0 && context.source) {
-      const incoming = angleBetween(player, context.source);
-      if (Math.abs(angleDiff(incoming, player.aim)) < degrees(105)) {
-        this.deflectEnemy(context.source);
-        return false;
-      }
+    if (context.kind !== "projectile" && context.source?.def && player.deflectTime > 0
+      && isWithinDeflectCone(player, context.source)) {
+      this.deflectEnemy(context.source);
+      return false;
     }
     if (player.invuln > 0) return false;
     const damage = Math.max(1, amount);
     player.hp -= damage;
     player.invuln = 0.42;
+    player.hurtTime = 0.10;
+    player.hurtAngle = Number.isFinite(context.angle)
+      ? context.angle
+      : context.source ? angleBetween(context.source, player) : player.aim + Math.PI;
+    player.action = null;
+    player.actionQueue = null;
     player.drive = Math.max(0, player.drive - 18);
     this.encounter.roomDamage += damage;
     this.metrics.damageEvents += 1;
     this.meta.statistics.damageTaken = (this.meta.statistics.damageTaken || 0) + damage;
     this.shake = Math.max(this.shake, 3.2);
+    this.addHitstop(2, 0.24);
     this.ui.damageFlash?.();
-    audioCall("hurt", { amount: damage });
-    if (context.angle != null) {
-      const knock = vecFromAngle(context.angle + Math.PI, 8);
-      this.movePlayer(knock.x, knock.y);
-    }
+    audioCall("hurt", { amount: damage, x: player.x });
+    this.applyPlayerKnockback(context, 8);
     if (player.hp <= 0) this.finishRun(false, "The burden claimed another name.");
     return true;
   }
@@ -2534,8 +2935,12 @@ export class ActionRuntime {
     this.metrics.deflects += 1;
     this.meta.statistics.deflects = (this.meta.statistics.deflects || 0) + 1;
     this.addDrive(10);
-    this.spawnBurst(this.run.player.x, this.run.player.y, COLORS.deflect, 12);
-    audioCall("perfect", { enemy: enemy.id });
+    this.run.player.deflectSuccess = 0.16;
+    this.addHitstop(3, 0.28);
+    this.shake = Math.max(this.shake, 2.2);
+    this.spawnImpact(this.run.player.x, this.run.player.y, this.run.player.aim, COLORS.deflect, 14, true);
+    this.encounter.effects.push({ type: "impact_ring", x: this.run.player.x, y: this.run.player.y, r: 15, time: 0.18, maxTime: 0.18, color: COLORS.deflect });
+    audioCall("perfect", { enemy: enemy.id, x: this.run.player.x, heavy: true });
     this.emitDeflectShards();
   }
 
@@ -2558,8 +2963,12 @@ export class ActionRuntime {
     if (weapon.resource?.type === "impact_charge") {
       player.impactCharge = clamp(player.impactCharge + (weapon.resource.gainOnDeflect || 35), 0, weapon.resource.max || 100);
     }
-    this.spawnBurst(projectile.x, projectile.y, COLORS.deflect, 8);
-    audioCall("deflect", { projectile: true });
+    player.deflectSuccess = 0.16;
+    this.addHitstop(3, 0.26);
+    this.shake = Math.max(this.shake, 2);
+    this.spawnImpact(projectile.x, projectile.y, angle, COLORS.deflect, 10, true);
+    this.encounter.effects.push({ type: "impact_ring", x: projectile.x, y: projectile.y, r: 13, time: 0.16, maxTime: 0.16, color: COLORS.deflect });
+    audioCall("deflect", { projectile: true, x: projectile.x, heavy: true });
     const splits = cargoEffects(this.run, "deflected_projectile_split")[0];
     if (splits) {
       for (const direction of [-1, 1]) {
@@ -2729,18 +3138,19 @@ export class ActionRuntime {
       if (projectile.faction === "enemy") {
         const playerHit = sweptProjectileHit({ x: projectile.px, y: projectile.py }, projectile, projectile.r, player);
         if (playerHit) {
-          if (player.deflectTime > 0 && projectile.deflectable) {
+          if (player.deflectTime > 0 && projectile.deflectable && isWithinDeflectCone(player, projectile)) {
             projectile.x = playerHit.x;
             projectile.y = playerHit.y;
             this.reflectProjectile(projectile);
           } else {
-            this.damagePlayer(projectile.damage, { source: projectile, angle: Math.atan2(projectile.vy, projectile.vx), kind: "projectile" });
-            if (projectile.kind === "tether" && projectile.source && !projectile.source.dead) {
+            const landed = this.damagePlayer(projectile.damage, { source: projectile, angle: Math.atan2(projectile.vy, projectile.vx), kind: "projectile" });
+            if (landed && projectile.kind === "tether" && projectile.source && !projectile.source.dead) {
               const pull = normalizeVector(projectile.source.x - player.x, projectile.source.y - player.y);
-              this.movePlayer(pull.x * 15, pull.y * 15);
+              const pullDistance = projectile.pullDistance || 15;
+              this.movePlayer(pull.x * pullDistance, pull.y * pullDistance);
               player.status.tethered = 1.2;
             }
-            if (/slow_orb/.test(projectile.kind || "")) player.status.slowed = 1.6;
+            if (landed && /slow_orb/.test(projectile.kind || "")) player.status.slowed = 1.6;
             projectile.life = 0;
           }
           continue;
@@ -2787,17 +3197,18 @@ export class ActionRuntime {
           break;
         }
         for (const enemy of this.encounter.enemies) {
-          if (enemy.dead || projectile.hitIds.has(enemy.uid)) continue;
+          if (enemy.dead || enemy.state === "enter" || projectile.hitIds.has(enemy.uid)) continue;
           const hit = sweptProjectileHit({ x: projectile.px, y: projectile.py }, projectile, projectile.r, enemy);
           if (!hit) continue;
-          projectile.hitIds.add(enemy.uid);
-          this.damageEnemy(enemy, projectile.damage, projectile.poise, {
+          const landed = this.damageEnemy(enemy, projectile.damage, projectile.poise, {
             source: "projectile",
             technique: projectile.kind === "pin",
             reflected: Boolean(projectile.reflected),
             projectile,
             angle: Math.atan2(projectile.vy, projectile.vx),
           });
+          if (!landed) continue;
+          projectile.hitIds.add(enemy.uid);
           if (projectile.mark) {
             enemy.mark = Math.max(enemy.mark, 5);
             if (!enemy.boss) {
@@ -2912,13 +3323,18 @@ export class ActionRuntime {
       } else if (hazard.type === "moving_cover_cart") {
         const path = hazard.path || [];
         if (path.length > 1) {
-          const segmentLength = 70;
           const ascentSpeed = this.run.phase === "ascent" ? (hazard.ascentSpeedMultiplier || 1) : 1;
-          const progress = hazard.timer * (hazard.speed || 40) * ascentSpeed * (hazard.directionSign || 1) / segmentLength;
-          const wrappedProgress = ((progress % path.length) + path.length) % path.length;
-          const index = Math.floor(wrappedProgress) % path.length;
+          const lengths = path.map((point, index) => dist(point, path[(index + 1) % path.length]));
+          const totalLength = lengths.reduce((sum, length) => sum + length, 0);
+          hazard.travelled += (hazard.speed || 40) * ascentSpeed * (hazard.directionSign || 1) * dt;
+          let wrappedDistance = ((hazard.travelled % totalLength) + totalLength) % totalLength;
+          let index = 0;
+          while (index < lengths.length - 1 && wrappedDistance > lengths[index]) {
+            wrappedDistance -= lengths[index];
+            index += 1;
+          }
           const nextIndex = (index + 1) % path.length;
-          const t = wrappedProgress - Math.floor(wrappedProgress);
+          const t = lengths[index] > 0 ? wrappedDistance / lengths[index] : 0;
           hazard.center = { x: lerp(path[index].x, path[nextIndex].x, t), y: lerp(path[index].y, path[nextIndex].y, t) };
           if (circlesIntersect({ ...hazard.center, r: hazard.radius || 9 }, player) && hazard.hitTimer <= 0) {
             this.damagePlayer(hazard.damage || 16, { source: hazard.center, angle: angleBetween(hazard.center, player), kind: "hazard" });
@@ -2979,9 +3395,11 @@ export class ActionRuntime {
         const step = hazard.step || 3;
         const safeIndex = Math.floor(hazard.timer / step) % Math.max(1, rects.length);
         const withinStep = hazard.timer % step;
+        const tellDuration = hazard.tell || 0.55;
+        const activeDuration = Math.min(0.65, step * 0.25);
         hazard.safeIndex = safeIndex;
-        hazard.tellActive = withinStep > step - (hazard.tell || 0.55);
-        hazard.active = withinStep < Math.min(0.65, step * 0.25);
+        hazard.tellActive = withinStep < tellDuration;
+        hazard.active = withinStep >= tellDuration && withinStep < tellDuration + activeDuration;
         if (hazard.active && hazard.hitTimer <= 0) {
           rects.forEach((rect, index) => {
             if (index !== safeIndex && circleRectOverlap(player, rect)) {
@@ -3026,7 +3444,7 @@ export class ActionRuntime {
         this.resolvePlayerAction(action);
       } else if (effect.type === "damage_zone") {
         for (const enemy of this.encounter.enemies) {
-          if (enemy.dead || effect.hitIds.has(enemy.uid) || distSq(effect, enemy) > (effect.r + enemy.r) ** 2) continue;
+          if (enemy.dead || enemy.state === "enter" || effect.hitIds.has(enemy.uid) || distSq(effect, enemy) > (effect.r + enemy.r) ** 2) continue;
           effect.hitIds.add(enemy.uid);
           this.damageEnemy(enemy, effect.damage, effect.poise, { source: "hazard", angle: angleBetween(effect, enemy) });
         }
@@ -3114,27 +3532,54 @@ export class ActionRuntime {
 
   updateEncounter(dt) {
     const encounter = this.encounter;
-    const living = encounter.enemies.filter((enemy) => !enemy.dead);
+    let living = encounter.enemies.filter((enemy) => !enemy.dead);
+    const bossAlive = Boolean(encounter.boss && !encounter.boss.dead);
+    encounter.hunterCooldown = Math.max(0, (encounter.hunterCooldown || 0) - dt);
 
     // Attention punishes disengagement with a new tactical role, never raw damage scaling.
     const attacking = this.run.player.driveIdle < 0.7;
     const attentionMultiplier = cargoEffects(this.run, "attention_gain_multiplier").reduce((value, effect) => value * (effect.value || 1), hasTechnique(this.run, "cursed_dividend") ? 1.25 : 1);
-    encounter.attention = clamp(encounter.attention + dt * (attacking ? -7 : (this.run.phase === "ascent" ? 9 : 6)) * attentionMultiplier, 0, 100);
-    if (encounter.attention >= 100) {
-      encounter.attention = 34;
-      const pool = enemyPoolFor(this.run.roomIndex, this.run.phase).filter((enemy) => /hound|skitter|lancer|riveter|counterfeit|confiscator/.test(enemy.id));
-      this.spawnBudgetEnemies(2 + Math.floor(this.run.roomIndex / 7), pool.length ? pool : null);
-      this.ui.toast?.("THE ABYSS SENDS A HUNTER");
-      audioCall("enemyTell", { hunter: true });
+    if (!bossAlive && encounter.time >= 4 && living.length > 0) {
+      encounter.attention = clamp(encounter.attention + dt * (attacking ? -7 : (this.run.phase === "ascent" ? 9 : 6)) * attentionMultiplier, 0, 100);
     }
 
     const nextWave = encounter.waves[encounter.waveIndex + 1];
+    const batchGapReady = encounter.time - (encounter.lastMaterializeTime ?? -Infinity) >= 0.75;
+    let spawnedBatch = false;
     if (nextWave) {
       const condition = nextWave.startWhen || {};
       const threshold = condition.remainingAtMost ?? 0;
-      const after = condition.after ?? nextWave.delay ?? 0.25;
-      if ((living.length <= threshold || encounter.time >= after) && encounter.time >= 0.35) this.spawnNextWave();
-    } else if (living.length === 0 && !encounter.clear) {
+      const firstWave = encounter.waveIndex < 0;
+      const after = firstWave
+        ? Math.max(encounter.waveDelay || 0.55, nextWave.delay || 0)
+        : condition.after ?? nextWave.delay ?? 0.25;
+      const noMaterializingEnemies = living.every((enemy) => enemy.state !== "enter");
+      const timeoutReady = encounter.time >= after && living.length <= threshold + 2 && noMaterializingEnemies;
+      const ready = firstWave
+        ? encounter.time >= after
+        : (living.length <= threshold || timeoutReady) && encounter.time >= 0.35;
+      if (ready && batchGapReady) {
+        this.spawnNextWave();
+        spawnedBatch = true;
+      }
+    }
+
+    if (!spawnedBatch && !nextWave && !bossAlive && encounter.attention >= 100 && encounter.hunterCooldown <= 0
+      && !encounter.hunterSpawned && batchGapReady && living.every((enemy) => enemy.state !== "enter")) {
+      encounter.attention = 34;
+      encounter.hunterCooldown = 25;
+      encounter.hunterSpawned = true;
+      const pool = enemyPoolFor(this.run.roomIndex, this.run.phase).filter((enemy) => /hound|skitter|lancer|riveter|counterfeit|confiscator/.test(enemy.id));
+      const spawned = this.spawnBudgetEnemies(2 + Math.floor(this.run.roomIndex / 7), pool.length ? pool : null);
+      if (spawned > 0) {
+        this.ui.toast?.("THE ABYSS SENDS A HUNTER");
+        audioCall("enemyTell", { hunter: true });
+      }
+    }
+
+    living = encounter.enemies.filter((enemy) => !enemy.dead);
+    const unspawnedWave = encounter.waves[encounter.waveIndex + 1];
+    if (!unspawnedWave && living.length === 0 && !encounter.clear) {
       encounter.clear = true;
       encounter.clearTimer = 0.72;
       audioCall("roomClear", { phase: this.run.phase });
@@ -3436,7 +3881,7 @@ export class ActionRuntime {
     if (this.scene !== "playing") return;
     const player = this.run.player;
     const target = this.encounter.enemies
-      .filter((enemy) => !enemy.dead)
+      .filter((enemy) => !enemy.dead && enemy.state !== "enter")
       .sort((a, b) => distSq(player, a) - distSq(player, b))[0];
     const held = new Set(["primary"]);
     if (!target) {
@@ -3482,8 +3927,11 @@ export class ActionRuntime {
     const dashCharge = 1 - clamp(player.dashCooldown / tier.dashCooldown, 0, 1);
     const hunted = this.encounter.attention >= 72;
     const pressure = hunted ? this.encounter.attention : player.drive;
+    const visibleCombatants = [player, ...this.encounter.enemies.filter((enemy) => !enemy.dead && enemy.state !== "enter")];
     this.ui.updateHud?.({
-      player: { hp: player.hp, maxHp: player.maxHp, dashCharge },
+      player: { hp: player.hp, maxHp: player.maxHp, dashCharge, x: player.x, y: player.y },
+      combatNearTop: visibleCombatants.some((combatant) => combatant.y < 34),
+      combatNearBottom: visibleCombatants.some((combatant) => combatant.y > 146),
       biome: this.encounter.biome,
       zoneName: this.encounter.biome.name,
       phase: run.phase,
@@ -3507,6 +3955,7 @@ export class ActionRuntime {
 
   updateCosmetics(dt) {
     if (!this.encounter) return;
+    this.impactFlash = Math.max(0, this.impactFlash - dt * 5.5);
     for (const particle of this.encounter.particles) {
       particle.life -= dt;
       particle.x += particle.vx * dt;
@@ -3531,6 +3980,20 @@ export class ActionRuntime {
     }
   }
 
+  spawnImpact(x, y, angle, color, count = 8, heavy = false) {
+    const visualRng = this.run?.rng || new SeededRng(1);
+    for (let index = 0; index < count; index += 1) {
+      const side = visualRng.chance() ? Math.PI / 2 : -Math.PI / 2;
+      const sparkAngle = angle + side + visualRng.range(-0.72, 0.72);
+      const speed = visualRng.range(heavy ? 28 : 18, heavy ? 76 : 48);
+      this.spawnParticle(
+        x, y, color, visualRng.range(heavy ? 0.18 : 0.12, heavy ? 0.42 : 0.28),
+        Math.cos(sparkAngle) * speed, Math.sin(sparkAngle) * speed,
+        visualRng.chance(heavy ? 0.38 : 0.16) ? 2 : 1,
+      );
+    }
+  }
+
   render() {
     if (!this.renderer) return;
     const ctx = this.renderer.beginFrame(this.encounter?.biome?.shadow || "#06090d");
@@ -3546,6 +4009,7 @@ export class ActionRuntime {
     this.renderEntrances(ctx);
     this.renderDecor();
     this.renderHazards(ctx);
+    this.renderEnemyTelegraphs(ctx);
     this.renderEffects(ctx);
     for (const barrier of encounter.barriers) this.renderBarrier(ctx, barrier);
     for (const prism of encounter.prisms) this.renderPrism(ctx, prism);
@@ -3554,6 +4018,12 @@ export class ActionRuntime {
     this.renderPlayer(ctx);
     this.renderer.drawParticles(encounter.particles);
     ctx.restore();
+    if (this.impactFlash > 0) {
+      ctx.globalAlpha = Math.min(0.12, this.impactFlash * 0.32);
+      ctx.fillStyle = COLORS.white;
+      ctx.fillRect(0, 0, WORLD.w, WORLD.h);
+      ctx.globalAlpha = 1;
+    }
   }
 
   renderEntrances(ctx) {
@@ -3634,15 +4104,413 @@ export class ActionRuntime {
     }
   }
 
+  renderEnemyTelegraphs(ctx) {
+    const player = this.run.player;
+    for (const enemy of this.encounter.enemies) {
+      if (enemy.dead) continue;
+      if (enemy.state === "enter") {
+        const total = enemy.boss ? 0.85 : enemySpawnMaterializeTime(enemy.def);
+        const progress = 1 - clamp(enemy.stateTime / total, 0, 1);
+        const radius = enemy.r + 8 - progress * 3;
+        ctx.globalAlpha = 0.18 + progress * 0.38;
+        ctx.strokeStyle = enemy.boss ? COLORS.danger : enemy.def.color;
+        ctx.setLineDash([2, 2]);
+        ctx.beginPath();
+        ctx.arc(Math.round(enemy.x), Math.round(enemy.y), Math.round(radius), 0, TAU);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = enemy.def.color;
+        const cross = Math.max(2, Math.round(4 - progress * 2));
+        ctx.fillRect(Math.round(enemy.x - cross), Math.round(enemy.y), cross * 2 + 1, 1);
+        ctx.fillRect(Math.round(enemy.x), Math.round(enemy.y - cross), 1, cross * 2 + 1);
+        ctx.globalAlpha = 1;
+        continue;
+      }
+      if (enemy.state !== "tell" || !enemy.attack || !enemy.attackTimeline) continue;
+
+      const attack = enemy.attack;
+      const pattern = attack.pattern || "";
+      const railPattern = /king_hammer_rail|hammer_line_then_cross/.test(pattern);
+      const progress = 1 - clamp(enemy.stateTime / Math.max(0.001, enemy.attackTimeline.tell), 0, 1);
+      const hot = progress >= 0.68;
+      const returnable = /mine|crucible|spore|rivet/.test(pattern);
+      const color = returnable ? COLORS.deflect : hot ? COLORS.danger : COLORS.gold;
+      const range = /pounce_pair/.test(pattern)
+        ? Math.max(attack.range || 0, (attack.speed || enemy.def.speed * 2.5) * enemy.attackTimeline.active)
+        : railPattern ? (attack.range || 150) : this.enemyAttackRange(attack);
+      const target = enemy.lockedTarget || {
+        x: enemy.x + Math.cos(enemy.aim) * range,
+        y: enemy.y + Math.sin(enemy.aim) * range,
+      };
+      const end = {
+        x: enemy.x + Math.cos(enemy.aim) * range,
+        y: enemy.y + Math.sin(enemy.aim) * range,
+      };
+      const pulse = 0.55 + (Math.floor(this.time * (hot ? 24 : 12)) % 2) * 0.25;
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.globalAlpha = (0.22 + progress * 0.28) * pulse;
+
+      if (/root_burrow_rush/.test(pattern)) {
+        const center = enemy.burrowCenter || enemy.lockedTarget || target;
+        const count = attack.ringCount || 11;
+        const safeGaps = Math.max(1, Math.round((attack.safeGap || 60) / (360 / count)));
+        const gap = enemy.ringGaps?.[0] ?? 0;
+        ctx.beginPath();
+        ctx.arc(Math.round(center.x), Math.round(center.y), Math.round(enemy.r + player.r + 10), 0, TAU);
+        ctx.fill();
+        ctx.globalAlpha = 0.76;
+        ctx.stroke();
+        for (let index = 0; index < count; index += 1) {
+          if (Math.min((index - gap + count) % count, (gap - index + count) % count) < safeGaps) continue;
+          const angle = index / count * TAU + enemy.aim * 0.15;
+          ctx.beginPath();
+          ctx.moveTo(Math.round(center.x + Math.cos(angle) * 12), Math.round(center.y + Math.sin(angle) * 12));
+          ctx.lineTo(Math.round(center.x + Math.cos(angle) * 72), Math.round(center.y + Math.sin(angle) * 72));
+          ctx.stroke();
+        }
+      } else if (/glass_step/.test(pattern)) {
+        const crossCount = attack.crossCount || 4;
+        for (const [stepIndex, anchor] of (enemy.stepAnchors || [target]).entries()) {
+          ctx.beginPath();
+          ctx.arc(Math.round(anchor.x), Math.round(anchor.y), 7, 0, TAU);
+          ctx.stroke();
+          for (let index = 0; index < crossCount; index += 1) {
+            const angle = index / crossCount * TAU + (stepIndex % 2 ? Math.PI / 4 : 0);
+            ctx.beginPath();
+            ctx.moveTo(Math.round(anchor.x), Math.round(anchor.y));
+            ctx.lineTo(Math.round(anchor.x + Math.cos(angle) * 76), Math.round(anchor.y + Math.sin(angle) * 76));
+            ctx.stroke();
+          }
+        }
+      } else if (/prism_cage/.test(pattern)) {
+        const center = enemy.cageCenter || target;
+        const walls = [
+          { x: center.x - 24, y: center.y - 20, w: 48, h: 4 },
+          { x: center.x - 24, y: center.y + 16, w: 48, h: 4 },
+          { x: center.x - 24, y: center.y - 16, w: 4, h: 32 },
+          { x: center.x + 20, y: center.y - 16, w: 4, h: 32 },
+        ];
+        walls.forEach((wall, index) => {
+          if (index === enemy.cageGap) return;
+          ctx.fillRect(Math.round(wall.x), Math.round(wall.y), Math.round(wall.w), Math.round(wall.h));
+        });
+        ctx.globalAlpha = 0.9;
+        const gapWall = walls[enemy.cageGap ?? 0];
+        ctx.strokeRect(Math.round(gapWall.x), Math.round(gapWall.y), Math.round(gapWall.w), Math.round(gapWall.h));
+      } else if (/spawn_barrier|barrier_cross/.test(pattern)) {
+        for (const wall of enemy.barrierRects || []) {
+          ctx.globalAlpha = 0.2 + progress * 0.34;
+          ctx.fillRect(Math.round(wall.x), Math.round(wall.y), Math.round(wall.w), Math.round(wall.h));
+          ctx.globalAlpha = 0.82;
+          ctx.strokeRect(Math.round(wall.x), Math.round(wall.y), Math.round(wall.w), Math.round(wall.h));
+        }
+      } else if (/thorn_lash/.test(pattern)) {
+        const lashRange = 36;
+        const lashArc = degrees((attack.arc || 80) + 48);
+        ctx.beginPath();
+        ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+        ctx.arc(Math.round(enemy.x), Math.round(enemy.y), lashRange, enemy.aim - lashArc / 2, enemy.aim + lashArc / 2);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 0.76;
+        ctx.stroke();
+        const projectileCount = attack.finalProjectiles || 0;
+        const projectileCenter = (projectileCount - 1) / 2;
+        for (let index = 0; index < projectileCount; index += 1) {
+          const angle = enemy.aim + degrees((index - projectileCenter) * (attack.spread || 12));
+          ctx.beginPath();
+          ctx.moveTo(Math.round(enemy.x + Math.cos(angle) * lashRange), Math.round(enemy.y + Math.sin(angle) * lashRange));
+          ctx.lineTo(Math.round(enemy.x + Math.cos(angle) * 88), Math.round(enemy.y + Math.sin(angle) * 88));
+          ctx.stroke();
+        }
+      } else if (/root_wall_wave/.test(pattern)) {
+        const waveRange = 112;
+        const waveArc = degrees(48);
+        ctx.beginPath();
+        ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+        ctx.arc(Math.round(enemy.x), Math.round(enemy.y), waveRange, enemy.aim - waveArc / 2, enemy.aim + waveArc / 2);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 0.76;
+        ctx.stroke();
+      } else if (/halo_burst/.test(pattern)) {
+        const count = attack.countPerRing || 8;
+        const safeGaps = Math.max(1, Math.round((attack.safeGap || 55) / (360 / count)));
+        for (let ring = 0; ring < (attack.rings || 2); ring += 1) {
+          const gap = enemy.ringGaps?.[ring] ?? 0;
+          const offset = degrees((attack.offsetSecondRing || 18) * ring) + enemy.aim * 0.15;
+          for (let index = 0; index < count; index += 1) {
+            if (Math.min((index - gap + count) % count, (gap - index + count) % count) < safeGaps) continue;
+            const angle = index / count * TAU + offset;
+            ctx.beginPath();
+            ctx.moveTo(Math.round(enemy.x + Math.cos(angle) * (enemy.r + 3)), Math.round(enemy.y + Math.sin(angle) * (enemy.r + 3)));
+            ctx.lineTo(Math.round(enemy.x + Math.cos(angle) * 82), Math.round(enemy.y + Math.sin(angle) * 82));
+            ctx.stroke();
+          }
+        }
+      } else if (/copy_last_player_action/.test(pattern)) {
+        if (["repeater", "prism"].includes(enemy.copiedWeaponId)) {
+          for (let index = 0; index < 3; index += 1) {
+            const angle = enemy.aim + degrees((index - 1) * 7);
+            ctx.beginPath();
+            ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+            ctx.lineTo(Math.round(enemy.x + Math.cos(angle) * range), Math.round(enemy.y + Math.sin(angle) * range));
+            ctx.stroke();
+          }
+        } else {
+          const arc = degrees(110);
+          ctx.beginPath();
+          ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+          ctx.arc(Math.round(enemy.x), Math.round(enemy.y), 28, enemy.aim - arc / 2, enemy.aim + arc / 2);
+          ctx.closePath();
+          ctx.fill();
+          ctx.globalAlpha = 0.76;
+          ctx.stroke();
+        }
+      } else if (/aimed_burst|predictive_pair/.test(pattern)) {
+        const count = attack.count || (pattern.includes("pair") ? 2 : 4);
+        for (let index = 0; index < count; index += 1) {
+          const angle = enemy.aim + degrees((index - (count - 1) / 2) * (attack.spread || 3));
+          ctx.beginPath();
+          ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+          ctx.lineTo(Math.round(enemy.x + Math.cos(angle) * range), Math.round(enemy.y + Math.sin(angle) * range));
+          ctx.stroke();
+        }
+      } else if (/refraction_lance|clone_lances|mirrored_ricochet_pair/.test(pattern)) {
+        const count = attack.count || attack.lanes || (pattern.includes("pair") ? 2 : 3);
+        const offsets = Array.isArray(attack.angles)
+          ? attack.angles
+          : Array.from({ length: count }, (_, index) => (index - (count - 1) / 2) * (attack.spread || 3));
+        for (const offset of offsets) {
+          const angle = enemy.aim + degrees(offset);
+          ctx.beginPath();
+          ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+          ctx.lineTo(Math.round(enemy.x + Math.cos(angle) * range), Math.round(enemy.y + Math.sin(angle) * range));
+          ctx.stroke();
+        }
+        if (/clone_lances/.test(pattern)) {
+          for (const [mirrorIndex, mirror] of (enemy.mirrors || []).entries()) {
+            if (mirror.disabled > 0) continue;
+            const angle = enemy.mirrorAims?.[mirrorIndex] ?? angleBetween(mirror, target);
+            ctx.beginPath();
+            ctx.moveTo(Math.round(mirror.x), Math.round(mirror.y));
+            ctx.lineTo(Math.round(mirror.x + Math.cos(angle) * range), Math.round(mirror.y + Math.sin(angle) * range));
+            ctx.stroke();
+          }
+        }
+      } else if (railPattern) {
+        const sideRange = attack.crossRange || 105;
+        const sideX = -Math.sin(enemy.aim) * sideRange;
+        const sideY = Math.cos(enemy.aim) * sideRange;
+        ctx.lineWidth = Math.max(4, Math.round(attack.lineWidth || 14));
+        ctx.beginPath();
+        ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+        ctx.lineTo(Math.round(end.x), Math.round(end.y));
+        ctx.stroke();
+        ctx.globalAlpha = 0.76;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(Math.round(enemy.x - sideX), Math.round(enemy.y - sideY));
+        ctx.lineTo(Math.round(enemy.x + sideX), Math.round(enemy.y + sideY));
+        ctx.stroke();
+        ctx.setLineDash([]);
+      } else if (/hammer_combo_ring/.test(pattern)) {
+        ctx.globalAlpha = 0.28 + progress * 0.34;
+        ctx.lineWidth = hot ? 2 : 1;
+        for (let strike = 0; strike < (attack.strikes || 3); strike += 1) {
+          ctx.beginPath();
+          ctx.arc(Math.round(enemy.x), Math.round(enemy.y), 22 + strike * 4, 0, TAU);
+          ctx.stroke();
+        }
+        const count = attack.finalRingCount || 14;
+        const gap = enemy.ringGaps?.[0] ?? 0;
+        const safeGaps = attack.safeGaps || 0;
+        for (let index = 0; index < count; index += 1) {
+          if (safeGaps && Math.min((index - gap + count) % count, (gap - index + count) % count) < safeGaps) continue;
+          const angle = index / count * TAU + enemy.aim * 0.15;
+          ctx.beginPath();
+          ctx.moveTo(Math.round(enemy.x + Math.cos(angle) * 32), Math.round(enemy.y + Math.sin(angle) * 32));
+          ctx.lineTo(Math.round(enemy.x + Math.cos(angle) * 78), Math.round(enemy.y + Math.sin(angle) * 78));
+          ctx.stroke();
+        }
+      } else if (/bellows_sweep|sweeping_cone/.test(pattern)) {
+        const sweepCoverage = degrees((attack.arc || 65) + (attack.maxSweep || attack.sweep || 90));
+        ctx.beginPath();
+        ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+        ctx.arc(Math.round(enemy.x), Math.round(enemy.y), Math.round(range), enemy.aim - sweepCoverage / 2, enemy.aim + sweepCoverage / 2);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 0.75;
+        ctx.stroke();
+      } else if (/offset_ring|magnetic_pull_burst/.test(pattern)) {
+        ctx.globalAlpha = 0.24 + progress * 0.34;
+        ctx.lineWidth = hot ? 2 : 1;
+        ctx.beginPath();
+        ctx.arc(Math.round(enemy.x), Math.round(enemy.y), Math.round(range), 0, TAU);
+        ctx.stroke();
+        const spokes = attack.count || attack.burstCount || 10;
+        for (let spoke = 0; spoke < spokes; spoke += 1) {
+          const angle = spoke / spokes * TAU + enemy.aim * 0.15;
+          ctx.beginPath();
+          ctx.moveTo(Math.round(enemy.x + Math.cos(angle) * (enemy.r + 3)), Math.round(enemy.y + Math.sin(angle) * (enemy.r + 3)));
+          ctx.lineTo(Math.round(enemy.x + Math.cos(angle) * Math.min(range, 34)), Math.round(enemy.y + Math.sin(angle) * Math.min(range, 34)));
+          ctx.stroke();
+        }
+      } else if (/rivet_fan|projectile_fan/.test(pattern)) {
+        const fanArc = degrees(attack.arc || (attack.spread || 10) * Math.max(1, (attack.count || 3) - 1));
+        ctx.beginPath();
+        ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+        ctx.arc(Math.round(enemy.x), Math.round(enemy.y), Math.round(range), enemy.aim - fanArc / 2, enemy.aim + fanArc / 2);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 0.78;
+        ctx.stroke();
+      } else if (/sidestep_jab/.test(pattern)) {
+        ctx.globalAlpha = 0.58;
+        ctx.setLineDash([2, 2]);
+        ctx.beginPath();
+        ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+        for (const anchor of enemy.sidestepPath || []) ctx.lineTo(Math.round(anchor.x), Math.round(anchor.y));
+        ctx.stroke();
+        ctx.setLineDash([]);
+        const origin = enemy.jabOrigin || enemy;
+        const jabArc = degrees(70);
+        ctx.globalAlpha = 0.22 + progress * 0.36;
+        ctx.beginPath();
+        ctx.moveTo(Math.round(origin.x), Math.round(origin.y));
+        ctx.arc(Math.round(origin.x), Math.round(origin.y), Math.round(attack.range || 15), enemy.aim - jabArc / 2, enemy.aim + jabArc / 2);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 0.78;
+        ctx.stroke();
+      } else if (/charge|leap|pounce|rush|shield_bash|steal_then_flee/.test(pattern)) {
+        ctx.lineWidth = Math.max(3, Math.round(enemy.r * 2 + player.r * 1.5));
+        ctx.beginPath();
+        ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+        ctx.lineTo(Math.round(end.x), Math.round(end.y));
+        ctx.stroke();
+        ctx.globalAlpha = 0.8;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+        ctx.lineTo(Math.round(end.x), Math.round(end.y));
+        ctx.stroke();
+        ctx.setLineDash([]);
+      } else if (/melee|jab|sweep|bash/.test(pattern)) {
+        const arc = degrees(attack.arc || (pattern.includes("sweep") ? 90 : 105));
+        ctx.beginPath();
+        ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+        ctx.arc(Math.round(enemy.x), Math.round(enemy.y), Math.round(range), enemy.aim - arc / 2, enemy.aim + arc / 2);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 0.72;
+        ctx.beginPath();
+        ctx.arc(Math.round(enemy.x), Math.round(enemy.y), Math.round(range), enemy.aim - arc / 2, enemy.aim + arc / 2);
+        ctx.stroke();
+      } else if (/mortar|pod|crucible_toss|lob_interactive_mine|cage/.test(pattern)) {
+        const radius = attack.blastRadius || attack.poolRadius || attack.radius || (pattern.includes("cage") ? 24 : 17);
+        for (const warningTarget of enemy.telegraphTargets || [target]) {
+          ctx.beginPath();
+          ctx.arc(Math.round(warningTarget.x), Math.round(warningTarget.y), Math.round(radius), 0, TAU);
+          ctx.fill();
+          ctx.globalAlpha = 0.8;
+          ctx.stroke();
+        }
+      } else if (/cage|ring|halo|burst/.test(pattern) && attack.blastRadius) {
+        const radius = attack.blastRadius || attack.radius || (pattern.includes("cage") ? 24 : 16);
+        ctx.beginPath();
+        ctx.arc(Math.round(target.x), Math.round(target.y), Math.round(radius), 0, TAU);
+        ctx.fill();
+        ctx.globalAlpha = 0.8;
+        ctx.stroke();
+      } else if (/empower|link|barrier|channel|blink/.test(pattern)) {
+        ctx.globalAlpha = 0.34 + progress * 0.3;
+        ctx.beginPath();
+        ctx.arc(Math.round(enemy.x), Math.round(enemy.y), Math.round(enemy.r + 5 + progress * 3), 0, TAU);
+        ctx.stroke();
+      } else {
+        ctx.lineWidth = /beam|lance/.test(pattern) ? Math.max(2, Math.round(attack.lineWidth || (pattern.includes("beam") ? 5 : 3))) : 1;
+        ctx.setLineDash(hot ? [] : [4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(Math.round(enemy.x), Math.round(enemy.y));
+        ctx.lineTo(Math.round(end.x), Math.round(end.y));
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.lineWidth = 1;
+      }
+
+      if (hot && !/empower|link|barrier|channel|hammer_combo|magnetic|offset_ring|copy_last_player_action|aimed_burst|predictive_pair|sidestep_jab|fan|bellows|sweeping_cone|crucible_toss|mortar|glass_step|thorn_lash|root_wall_wave|halo_burst|refraction_lance|clone_lances/.test(pattern)) {
+        ctx.globalAlpha = 0.9;
+        ctx.fillRect(Math.round(target.x - 3), Math.round(target.y), 7, 1);
+        ctx.fillRect(Math.round(target.x), Math.round(target.y - 3), 1, 7);
+      }
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([]);
+    }
+  }
+
   renderEffects(ctx) {
     for (const effect of this.encounter.effects) {
-      if (effect.type === "slash") {
+      if (effect.type === "player_afterimage") {
+        const alpha = clamp(effect.time / Math.max(0.001, effect.maxTime || 0.13), 0, 1) * 0.42;
+        this.renderer.drawPixelEntity({
+          sprite: PLAYER_SPRITE,
+          x: effect.x,
+          y: effect.y,
+          drawSize: 15,
+          facing: effect.angle,
+          alpha,
+          shadow: false,
+          scaleX: 1.16,
+          scaleY: 0.82,
+        });
+      } else if (effect.type === "slash") {
+        const maxTime = effect.maxTime || 0.12;
+        const progress = 1 - clamp(effect.time / maxTime, 0, 1);
+        const radius = effect.r || Math.hypot(effect.x2 - effect.x, effect.y2 - effect.y);
+        const arc = degrees(effect.arc || 85);
+        const start = effect.angle - arc * 0.58;
+        const end = start + arc * (0.42 + progress * 0.72);
         ctx.strokeStyle = effect.color;
-        ctx.lineWidth = 2;
+        for (let trail = 0; trail < 3; trail += 1) {
+          ctx.globalAlpha = clamp(effect.time / maxTime, 0, 1) * (0.82 - trail * 0.22);
+          ctx.lineWidth = effect.heavy && trail === 0 ? 3 : trail === 0 ? 2 : 1;
+          ctx.beginPath();
+          ctx.arc(Math.round(effect.x), Math.round(effect.y), Math.max(4, Math.round(radius - trail * 3)), start, end - trail * 0.08);
+          ctx.stroke();
+        }
+        const tip = vecFromAngle(end, radius);
+        ctx.globalAlpha = clamp(effect.time / maxTime, 0, 1);
+        ctx.fillStyle = COLORS.white;
+        ctx.fillRect(Math.round(effect.x + tip.x - 1), Math.round(effect.y + tip.y - 1), effect.heavy ? 3 : 2, effect.heavy ? 3 : 2);
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = 1;
+      } else if (effect.type === "muzzle") {
+        const alpha = clamp(effect.time / Math.max(0.001, effect.maxTime || 0.055), 0, 1);
+        const length = 4 + alpha * 3;
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = COLORS.white;
+        ctx.save();
+        ctx.translate(Math.round(effect.x), Math.round(effect.y));
+        ctx.rotate(effect.angle || 0);
+        ctx.fillRect(0, -1, Math.round(length), 3);
+        ctx.fillStyle = effect.color;
+        ctx.fillRect(1, -3, 2, 7);
+        ctx.restore();
+        ctx.globalAlpha = 1;
+      } else if (effect.type === "deflect_arc") {
+        const alpha = clamp(effect.time / Math.max(0.001, effect.maxTime || 0.13), 0, 1);
+        ctx.globalAlpha = 0.35 + alpha * 0.5;
+        ctx.strokeStyle = effect.color;
+        ctx.lineWidth = alpha > 0.65 ? 2 : 1;
         ctx.beginPath();
-        ctx.moveTo(Math.round(effect.x), Math.round(effect.y));
-        ctx.lineTo(Math.round(effect.x2), Math.round(effect.y2));
+        ctx.arc(Math.round(effect.x), Math.round(effect.y), effect.r || 11, effect.angle - degrees(DEFLECT_HALF_ARC), effect.angle + degrees(DEFLECT_HALF_ARC));
         ctx.stroke();
+        ctx.globalAlpha = 1;
         ctx.lineWidth = 1;
       } else if (effect.type === "strike_line") {
         ctx.strokeStyle = effect.color;
@@ -3665,7 +4533,18 @@ export class ActionRuntime {
         ctx.stroke();
         ctx.setLineDash([]);
         ctx.globalAlpha = 1;
-      } else if (["mine", "damage_zone", "hostile_zone", "slow_zone", "blast", "impact_ring"].includes(effect.type)) {
+      } else if (effect.type === "impact_ring") {
+        const maxTime = effect.maxTime || 0.18;
+        const progress = 1 - clamp(effect.time / maxTime, 0, 1);
+        ctx.globalAlpha = (1 - progress) * 0.8;
+        ctx.strokeStyle = effect.color;
+        ctx.lineWidth = progress < 0.5 ? 2 : 1;
+        ctx.beginPath();
+        ctx.arc(Math.round(effect.x), Math.round(effect.y), Math.max(2, Math.round((effect.r || 12) * (0.2 + progress * 0.8))), 0, TAU);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = 1;
+      } else if (["mine", "damage_zone", "hostile_zone", "slow_zone", "blast"].includes(effect.type)) {
         const pulse = Math.floor(this.time * 16) % 3;
         ctx.globalAlpha = effect.type === "slow_zone" ? 0.18 : effect.armed ? 0.46 : 0.25;
         ctx.strokeStyle = effect.color;
@@ -3704,6 +4583,10 @@ export class ActionRuntime {
 
   renderEnemy(ctx, enemy) {
     const size = enemy.boss ? Math.round(enemy.r * 2.25) : Math.max(11, Math.round(enemy.r * 2.2));
+    const reaction = clamp((enemy.hitReaction || 0) / (enemy.boss ? 0.13 : 0.10), 0, 1);
+    const tellPulse = enemy.state === "tell" ? 1 + Math.sin(this.time * 28) * 0.025 : 1;
+    const offsetX = Math.cos(enemy.hitAngle || 0) * (enemy.hitKick || 0);
+    const offsetY = Math.sin(enemy.hitAngle || 0) * (enemy.hitKick || 0);
     this.renderer.drawPixelEntity({
       sprite: enemy.def.sprite,
       x: enemy.x,
@@ -3714,6 +4597,11 @@ export class ActionRuntime {
       color: enemy.def.color,
       shadowColor: enemy.def.shadowColor,
       hitFlash: enemy.flash > 0,
+      offsetX,
+      offsetY,
+      rotation: reaction * 0.10 * signOr(Math.cos(enemy.hitAngle || 0)),
+      scaleX: tellPulse * (1 + reaction * 0.15),
+      scaleY: tellPulse * (1 - reaction * 0.14),
       alpha: enemy.dead ? clamp(enemy.stateTime / 0.48, 0, 1) : enemy.state === "enter" ? 0.66 : 1,
     });
     if (enemy.boss) {
@@ -3742,15 +4630,13 @@ export class ActionRuntime {
     }
     if (enemy.state === "tell") {
       const urgency = 1 - clamp(enemy.stateTime / enemy.attackTimeline.tell, 0, 1);
-      const length = /projectile|burst|lance|orb|fan|beam|charge/.test(enemy.attack.pattern) ? 18 + urgency * 16 : 9;
-      ctx.strokeStyle = urgency > 0.62 ? "#ff8461" : COLORS.gold;
-      ctx.globalAlpha = 0.45 + urgency * 0.5;
-      ctx.beginPath();
-      ctx.moveTo(Math.round(enemy.x + Math.cos(enemy.aim) * (enemy.r + 2)), Math.round(enemy.y + Math.sin(enemy.aim) * (enemy.r + 2)));
-      ctx.lineTo(Math.round(enemy.x + Math.cos(enemy.aim) * length), Math.round(enemy.y + Math.sin(enemy.aim) * length));
-      ctx.stroke();
       ctx.fillStyle = urgency > 0.62 ? COLORS.danger : COLORS.gold;
-      ctx.fillRect(Math.round(enemy.x - 2), Math.round(enemy.y - size / 2 - 4), 5, 2);
+      const tellWidth = Math.max(3, Math.round(3 + urgency * 5));
+      ctx.fillRect(Math.round(enemy.x - tellWidth / 2), Math.round(enemy.y - size / 2 - 5), tellWidth, urgency > 0.68 ? 2 : 1);
+    } else if (enemy.state === "recover") {
+      ctx.globalAlpha = 0.72;
+      ctx.fillStyle = COLORS.white;
+      ctx.fillRect(Math.round(enemy.x - 2), Math.round(enemy.y - size / 2 - 5), 5, 1);
       ctx.globalAlpha = 1;
     }
     if (!enemy.boss && (enemy.hp < enemy.maxHp || enemy.elite)) {
@@ -3767,44 +4653,173 @@ export class ActionRuntime {
     }
   }
 
+  renderPlayerCargo(ctx, player, offsetX = 0, offsetY = 0) {
+    if (this.run.phase !== "ascent" || this.run.carriedWeight <= 0) return;
+    const count = clamp(Math.ceil(this.run.carriedWeight / 32), 1, 3);
+    const back = player.aim + Math.PI;
+    const sideX = -Math.sin(back);
+    const sideY = Math.cos(back);
+    const baseX = player.x + offsetX + Math.cos(back) * 5;
+    const baseY = player.y + offsetY + Math.sin(back) * 5;
+    ctx.strokeStyle = "#c49a55";
+    ctx.globalAlpha = 0.72;
+    ctx.beginPath();
+    ctx.moveTo(Math.round(player.x + offsetX), Math.round(player.y + offsetY));
+    ctx.lineTo(Math.round(baseX + Math.cos(back) * (count - 1) * 3), Math.round(baseY + Math.sin(back) * (count - 1) * 3));
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    for (let index = count - 1; index >= 0; index -= 1) {
+      const stagger = (index % 2 ? 1 : -1) * Math.min(2, index);
+      const x = Math.round(baseX + Math.cos(back) * index * 3 + sideX * stagger);
+      const y = Math.round(baseY + Math.sin(back) * index * 3 + sideY * stagger);
+      ctx.fillStyle = "#1d1511";
+      ctx.fillRect(x - 2, y - 3, 5, 7);
+      ctx.fillStyle = index === 0 ? "#b17a3c" : index === 1 ? "#d0a04f" : "#76502d";
+      ctx.fillRect(x - 1, y - 2, 3, 5);
+      ctx.fillStyle = COLORS.gold;
+      ctx.fillRect(x, y - 3, 1, 1);
+    }
+  }
+
+  renderPlayerWeapon(ctx, player, weapon, bodyX, bodyY, action) {
+    const melee = /melee|hook|ground_cone/.test(action?.part?.pattern || "") || ["chainblade", "maul"].includes(this.run.weaponId);
+    const side = action?.step % 2 === 1 ? -1 : 1;
+    let angle = action?.angle ?? player.aim;
+    let recoil = player.recoil || 0;
+    if (action) {
+      const duration = Math.max(0.001, action[action.phase] || 0.1);
+      const progress = 1 - clamp(action.time / duration, 0, 1);
+      if (melee) {
+        if (action.phase === "startup") angle += side * lerp(0.18, -0.82, progress);
+        else if (action.phase === "active") angle += side * lerp(-0.82, 0.72, progress);
+        else angle += side * lerp(0.72, 0.16, progress);
+      } else if (action.phase === "active" || action.phase === "recovery") {
+        recoil = Math.max(recoil, (1 - progress) * 1.2);
+      }
+    }
+
+    ctx.save();
+    ctx.translate(
+      Math.round(bodyX + Math.cos(angle) * (2 - recoil * 1.5)),
+      Math.round(bodyY + Math.sin(angle) * (2 - recoil * 1.5)),
+    );
+    ctx.rotate(angle);
+    if (this.run.weaponId === "chainblade") {
+      ctx.fillStyle = "#171b20";
+      ctx.fillRect(1, -2, 13, 4);
+      ctx.fillStyle = weapon.color;
+      ctx.fillRect(2, -1, 11, 2);
+      ctx.fillStyle = "#f7f2dc";
+      ctx.fillRect(4, -1, 8, 1);
+      ctx.fillStyle = "#b88948";
+      for (let tooth = 5; tooth < 13; tooth += 3) ctx.fillRect(tooth, 1, 1, 2);
+    } else if (this.run.weaponId === "repeater") {
+      ctx.fillStyle = "#171b20";
+      ctx.fillRect(1, -3, 11, 6);
+      ctx.fillRect(4, 2, 3, 4);
+      ctx.fillStyle = weapon.color;
+      ctx.fillRect(2, -2, 8, 4);
+      ctx.fillStyle = "#f8dd9a";
+      ctx.fillRect(5, -1, 7, 1);
+      ctx.fillStyle = "#6f472b";
+      ctx.fillRect(5, 2, 2, 3);
+    } else if (this.run.weaponId === "maul") {
+      ctx.fillStyle = "#171b20";
+      ctx.fillRect(0, -2, 12, 4);
+      ctx.fillRect(9, -5, 7, 10);
+      ctx.fillStyle = "#8b6338";
+      ctx.fillRect(1, -1, 10, 2);
+      ctx.fillStyle = weapon.color;
+      ctx.fillRect(10, -4, 5, 8);
+      ctx.fillStyle = "#fff1b7";
+      ctx.fillRect(11, -3, 1, 6);
+    } else {
+      ctx.fillStyle = "#111923";
+      ctx.fillRect(-2, -2, 14, 5);
+      ctx.fillRect(1, 2, 3, 4);
+      ctx.fillRect(10, -1, 4, 2);
+      ctx.fillStyle = weapon.color;
+      ctx.fillRect(0, -1, 11, 3);
+      ctx.fillRect(6, -2, 3, 5);
+      ctx.fillStyle = "#e8ffff";
+      ctx.fillRect(7, -1, 2, 3);
+      ctx.fillRect(10, 0, 4, 1);
+      ctx.fillStyle = "#6f472b";
+      ctx.fillRect(1, 2, 2, 3);
+      ctx.fillStyle = "#35475a";
+      ctx.fillRect(-2, -1, 3, 3);
+    }
+    ctx.fillStyle = "#e7c49d";
+    ctx.fillRect(1, -1, 2, 2);
+    ctx.restore();
+  }
+
   renderPlayer(ctx) {
     const player = this.run.player;
     const weapon = Content.WEAPONS[this.run.weaponId];
-    if (this.run.phase === "ascent") {
-      const count = clamp(Math.ceil(this.run.carriedWeight / 18), 1, 5);
-      for (let index = count - 1; index >= 0; index -= 1) {
-        const offset = vecFromAngle(player.aim + Math.PI, 5 + index * 3);
-        ctx.fillStyle = index % 2 ? "#79552c" : COLORS.gold;
-        ctx.fillRect(Math.round(player.x + offset.x - 2), Math.round(player.y + offset.y - 2), 5, 5);
-        ctx.fillStyle = "#2b1a10";
-        ctx.fillRect(Math.round(player.x + offset.x - 1), Math.round(player.y + offset.y - 1), 3, 1);
+    const speed = Math.hypot(player.vx, player.vy);
+    const moving = speed > 18 && player.dashTime <= 0;
+    const bob = moving ? (Math.floor(this.time * 14) % 2 ? 0 : -1) : 0;
+    const action = player.action;
+    let offsetX = -Math.cos(player.aim) * (player.recoil || 0) * 1.5;
+    let offsetY = bob - Math.sin(player.aim) * (player.recoil || 0) * 1.5;
+    let rotation = clamp(player.vx / PLAYER_SPEED, -1, 1) * 0.045;
+    let scaleX = 1;
+    let scaleY = 1;
+    if (action) {
+      const duration = Math.max(0.001, action[action.phase] || 0.1);
+      const progress = 1 - clamp(action.time / duration, 0, 1);
+      if (action.phase === "startup") {
+        offsetX -= Math.cos(action.angle) * progress;
+        offsetY -= Math.sin(action.angle) * progress;
+        scaleY = 1 + progress * 0.04;
+      } else if (action.phase === "active") {
+        offsetX += Math.cos(action.angle) * 2;
+        offsetY += Math.sin(action.angle) * 2;
+        scaleX = 1.09;
+        scaleY = 0.91;
+      } else {
+        offsetX += Math.cos(action.angle) * (1 - progress) * 1.5;
+        offsetY += Math.sin(action.angle) * (1 - progress) * 1.5;
       }
     }
+    if (player.hurtTime > 0) {
+      const hurt = clamp(player.hurtTime / 0.10, 0, 1);
+      offsetX += Math.cos(player.hurtAngle || 0) * hurt * 2;
+      offsetY += Math.sin(player.hurtAngle || 0) * hurt * 2;
+      rotation += signOr(Math.cos(player.hurtAngle || 0)) * hurt * 0.12;
+      scaleX = 1.12;
+      scaleY = 0.88;
+    }
+
+    this.renderPlayerCargo(ctx, player, offsetX, offsetY);
     this.renderer.drawPixelEntity({
-      sprite: 92,
+      sprite: PLAYER_SPRITE,
       x: player.x,
       y: player.y,
       r: player.r,
-      drawSize: 14,
+      drawSize: 15,
       facing: player.aim,
       color: COLORS.player,
       shadowColor: "#111419",
+      offsetX,
+      offsetY,
+      rotation,
+      scaleX,
+      scaleY,
       invulnerableFlash: player.invuln > 0 && Math.floor(player.invuln * 30) % 2 === 0,
     });
-    const tip = vecFromAngle(player.aim, 8);
-    ctx.strokeStyle = weapon.color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(Math.round(player.x + Math.cos(player.aim) * 3), Math.round(player.y + Math.sin(player.aim) * 3));
-    ctx.lineTo(Math.round(player.x + tip.x), Math.round(player.y + tip.y));
-    ctx.stroke();
-    ctx.lineWidth = 1;
+    const bodyX = player.x + offsetX;
+    const bodyY = player.y + offsetY;
+    this.renderPlayerWeapon(ctx, player, weapon, bodyX, bodyY, action);
     if (player.deflectTime > 0) {
       ctx.strokeStyle = COLORS.deflect;
-      ctx.lineWidth = 2;
+      ctx.globalAlpha = player.deflectPerfectTime > 0 ? 1 : 0.62;
+      ctx.lineWidth = player.deflectPerfectTime > 0 ? 2 : 1;
       ctx.beginPath();
-      ctx.arc(Math.round(player.x), Math.round(player.y), 9, player.aim - degrees(55), player.aim + degrees(55));
+      ctx.arc(Math.round(bodyX), Math.round(bodyY), player.deflectSuccess > 0 ? 12 : 10, player.aim - degrees(DEFLECT_HALF_ARC), player.aim + degrees(DEFLECT_HALF_ARC));
       ctx.stroke();
+      ctx.globalAlpha = 1;
       ctx.lineWidth = 1;
     }
     if (player.drive >= 75) {

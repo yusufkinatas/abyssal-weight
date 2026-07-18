@@ -170,6 +170,7 @@ button {
   grid-template-columns: minmax(190px, 1fr) minmax(240px, 1.25fr) minmax(210px, 1fr);
   align-items: start;
   gap: clamp(8px, 1.1vw, 16px);
+  transition: opacity 90ms linear;
 }
 
 .hud-card {
@@ -382,6 +383,14 @@ button {
   align-items: end;
   justify-content: space-between;
   gap: 16px;
+  transition: opacity 90ms linear;
+}
+
+/* Edge combat remains readable: panels yield when an actor crosses beneath them. */
+.hud-layer.combat-near-top .hud-top,
+.hud-layer.combat-near-bottom .hud-bottom,
+.hud-layer.combat-near-bottom .boss-hud {
+  opacity: 0.42;
 }
 
 .loadout-card {
@@ -461,6 +470,7 @@ button {
   border-top: 3px solid var(--danger);
   background: rgb(12 8 10 / 94%);
   box-shadow: var(--hard-shadow);
+  transition: opacity 90ms linear;
 }
 
 .boss-heading strong {
@@ -653,9 +663,10 @@ button {
 
 .toast-layer {
   z-index: 28;
-  top: 20%;
+  top: clamp(100px, 15vh, 126px);
   left: 50%;
-  width: min(620px, calc(100% - 36px));
+  width: max-content;
+  max-width: min(390px, calc(100% - 36px));
   translate: -50% 0;
   display: grid;
   justify-items: center;
@@ -665,13 +676,14 @@ button {
 
 .toast,
 .toast-layer:not(:empty) {
-  padding: 11px 16px;
-  border: 2px solid var(--gold);
+  padding: 6px 10px;
+  border: 1px solid var(--gold);
   color: var(--text);
-  background: #0b1115;
-  font-size: 15px;
+  background: rgb(7 13 17 / 86%);
+  font-size: 13px;
   font-weight: 800;
-  box-shadow: var(--hard-shadow);
+  box-shadow: 3px 3px 0 rgb(0 0 0 / 38%);
+  text-align: center;
 }
 
 .room-banner {
